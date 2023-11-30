@@ -22,3 +22,4 @@ This code is written with very little experience with Golang.
 - GET http://localhost:8080/api/albums/6
 - GET http://localhost:8080/api/albums/artist/John
 - DELETE http://localhost:8080/api/albums/6
+- GET http://localhost:8080/api/weather/33.8938/35.5018

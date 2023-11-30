@@ -1,7 +1,7 @@
 {
 	"info": {
 		"_postman_id": "eee63f7b-e227-4b94-be4d-369bff354960",
-		"name": "albums",
+		"name": "go-crud",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
 		"_exporter_id": "24786876"
 	},
@@ -284,6 +284,38 @@
 						"api",
 						"albums",
 						"6"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "current weather",
+			"request": {
+				"auth": {
+					"type": "bearer",
+					"bearer": [
+						{
+							"key": "token",
+							"value": "{{token}}",
+							"type": "string"
+						}
+					]
+				},
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8080/api/weather/33.8938/35.5018",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"api",
+						"weather",
+						"33.8938",
+						"35.5018"
 					]
 				}
 			},
