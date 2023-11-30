@@ -31,6 +31,9 @@ func AddRouters() {
 			protected.PUT("/:id", services.UpdateAlbum)
 			protected.DELETE("/:id", services.DeleteAlbum)
 		}
+		weather := api.Group("/weather").Use(middlewares.AuthHandler())
+		weather.GET("/:lat/:long", services.CurrentWeather)
+
 	}
 
 	err := router.Run("localhost:8080")
