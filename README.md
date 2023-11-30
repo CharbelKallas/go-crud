@@ -10,7 +10,6 @@ This code is written with very little experience with Golang.
 - go-sql-driver/mysql database access,
 - dgrijalva/jwt-go for jwt
 - gin-gonic/gin to expose Rest APIs
-- joho/godotenv to use set envirement variables inside .env
 
 ### API
 
