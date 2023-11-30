@@ -19,7 +19,8 @@ func ConnectToDb() {
 		DBName: os.Getenv("DB_DATABASE"),
 	}
 
-	Db, err := sql.Open("mysql", cfg.FormatDSN())
+	var err error
+	Db, err = sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		log.Fatal(err)
 	}
