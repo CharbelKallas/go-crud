@@ -1,25 +1,93 @@
 # Golang CRUD
 
-## About
+A small REST API in Go ([Gin](https://github.com/gin-gonic/gin) + MySQL):
 
-This code is written with very little experience with Golang.
+- **Auth**: sign up, log in (JWT access + refresh tokens), refresh tokens.
+- **Albums**: create, read, update, delete albums (title, artist, price); requires an access token.
+- **Weather**: current weather for a coordinate, proxied from [weatherapi.com](https://www.weatherapi.com/); requires an access token.
 
-## Prerequisites
+## Run with Docker (recommended)
 
-- go 1.21.4,
-- go-sql-driver/mysql database access,
-- dgrijalva/jwt-go for jwt
-- gin-gonic/gin to expose Rest APIs
+```bash
+cp .env.example .env    # then replace every value in .env
+docker compose up --build
+```
 
-### API
+The API listens on http://localhost:8080. MySQL is published on `127.0.0.1:3307` for local tools. Database migrations are applied automatically at startup (`MIGRATE_ON_START=true`).
 
-- POST http://localhost:8080/api/auth/signup/ { "name": "charbelkallas", "email": "ckallas@gmail.com", "password": "
-  charbelkallas" }
-- POST http://localhost:8080/api/auth/login/ { "email": "ckallas@gmail.com", "password": "charbelkallas" }
-- POST http://localhost:8080/api/albums/ { "title": "test", "artist": "test", "price": 1 }
-- PUT http://localhost:8080/api/albums/6 { "title": "test12", "artist": "test12", "price": 1 }
-- GET http://localhost:8080/api/albums
-- GET http://localhost:8080/api/albums/6
-- GET http://localhost:8080/api/albums/artist/John
-- DELETE http://localhost:8080/api/albums/6
-- GET http://localhost:8080/api/weather/33.8938/35.5018
+## Run locally
+
+Requires Go 1.26+ and a MySQL 8 server.
+
+```bash
+docker compose up -d mysql
+set -a; . ./.env; set +a
+DATABASE_ADDR=127.0.0.1:3307 go run .
+```
+
+## Configuration
+
+All configuration comes from environment variables. The app refuses to start if a required value is missing.
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `DB_USERNAME`, `DB_PASSWORD` | yes | | MySQL credentials |
+| `DATABASE_ADDR` | | `127.0.0.1:3306` | `host:port` |
+| `DB_DATABASE` | | `recordings` | |
+| `JWT_SECRET` | yes | | ≥ 32 bytes, e.g. `openssl rand -base64 48` |
+| `JWT_ISSUER` | | `go-crud` | |
+| `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL` | | `15m` / `12h` | Go durations |
+| `BCRYPT_COST` | | `12` | 10–31 |
+| `HTTP_ADDR` | | `:8080` | |
+| `MIGRATE_ON_START` | | `true` | |
+| `WEATHER_API_KEY` | | | Without it `/api/weather` answers 503 |
+| `WEATHER_API_BASE_URL` | | `https://api.weatherapi.com/v1` | |
+| `WEATHER_SIGNING_SECRET`, `WEATHER_SIGNING_CLIENT_ID` | | | Optional HMAC request signing; set both or neither |
+
+## API
+
+Protected routes need `Authorization: Bearer <Token>` using the **access** token from login. The refresh token is only accepted by `/api/auth/refresh`.
+
+| Method | Path | Success | Errors |
+|---|---|---|---|
+| POST | `/api/auth/signup` `{"name","email","password"}` | 201 `{"Message": ...}` | 400 invalid input (password 8–72 bytes), 409 email taken |
+| POST | `/api/auth/login` `{"email","password"}` | 200 `{"Token","RefreshToken"}` | 400, 401 |
+| POST | `/api/auth/refresh` `{"RefreshToken"}` | 200 `{"Token","RefreshToken"}` | 400, 401 |
+| GET | `/api/albums` | 200 `[album...]` (`[]` when empty) | 401 |
+| GET | `/api/albums/:id` | 200 `album` | 400 bad id, 404 |
+| GET | `/api/albums/artist/:artist` | 200 `[album...]` | 401 |
+| POST | `/api/albums` `{"title","artist","price"}` | 201 new id | 400 invalid (price 0–999.99) |
+| PUT | `/api/albums/:id` `{"title","artist","price"}` | 200 id | 400, 404 |
+| DELETE | `/api/albums/:id` | 200 id | 400, 404 |
+| GET | `/api/weather/:lat/:long` | 200 weather | 400 bad coordinates, 502 upstream error, 503 not configured |
+| GET | `/healthz` | 200 `{"status":"ok"}` | 503 database unreachable |
+
+Album responses look like `{"ID": 1, "Title": "Blue Train", "Artist": "John Coltrane", "Price": 56.99}`. Errors look like `{"message": "..."}`.
+
+A Postman collection is in [`postman/`](postman/go-crud.postman_collection.json); its login and refresh requests store the tokens in collection variables.
+
+## Tests
+
+```bash
+go test -race ./...
+```
+
+Integration tests run the repositories and the whole HTTP API against a real MySQL. **They delete every row in the `user` and `album` tables**, so they only run when `INTEGRATION_ALLOW_DB_RESET=1` is set; point them at a disposable database:
+
+```bash
+docker compose up -d mysql
+set -a; . ./.env; set +a
+INTEGRATION_ALLOW_DB_RESET=1 DATABASE_ADDR=127.0.0.1:3307 go test -race -tags integration ./integration/...
+```
+
+## Migrations
+
+SQL migrations live in [`migrations/`](migrations) ([golang-migrate](https://github.com/golang-migrate/migrate) format) and are embedded in the binary.
+
+`1731542400_user_email_unique` adds a unique index on `user.email`. If an existing database already contains duplicate emails, it fails and the app will not start. Find duplicates with:
+
+```sql
+SELECT email, COUNT(*) FROM user GROUP BY email HAVING COUNT(*) > 1;
+```
+
+Remove the duplicates, then mark the failed migration as not applied and restart: `migrate -path migrations -database "mysql://USER:PASS@tcp(HOST:PORT)/recordings" force 1481574547`.

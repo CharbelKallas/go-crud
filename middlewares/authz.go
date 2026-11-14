@@ -1,44 +1,51 @@
+// Package middlewares holds Gin middlewares.
 package middlewares
 
 import (
-	"go-crud/auth"
+	"log/slog"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
+	"go-crud/auth"
 )
 
-func AuthHandler() gin.HandlerFunc {
+// ContextEmailKey is the gin context key holding the authenticated email.
+const ContextEmailKey = "email"
+
+// AuthHandler requires a valid access token in "Authorization: Bearer <token>".
+// Refresh tokens are rejected.
+func AuthHandler(tokens *auth.TokenManager) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		clientToken := c.Request.Header.Get("Authorization")
-		if clientToken == "" {
-			c.JSON(403, "No Authorization header provided")
-			c.Abort()
+		scheme, token, found := strings.Cut(c.GetHeader("Authorization"), " ")
+		token = strings.TrimSpace(token)
+		if !found || !strings.EqualFold(scheme, "Bearer") || token == "" {
+			unauthorized(c, "missing or malformed Authorization header")
 			return
 		}
 
-		extractedToken := strings.Split(clientToken, "Bearer ")
-		if len(extractedToken) == 2 {
-			clientToken = strings.TrimSpace(extractedToken[1])
-		} else {
-			c.JSON(400, "Incorrect Format of Authorization Token")
-			c.Abort()
-			return
-		}
-
-		jwtWrapper := auth.JwtWrapper{
-			SecretKey: "undersecretary",
-			Issuer:    "AuthService",
-		}
-
-		claims, err := jwtWrapper.ValidateToken(clientToken)
+		claims, err := tokens.Validate(token, auth.AccessToken)
 		if err != nil {
-			c.JSON(401, err.Error())
-			c.Abort()
+			slog.InfoContext(c.Request.Context(), "access token rejected", "error", err)
+			unauthorized(c, "invalid or expired token")
 			return
 		}
 
-		c.Set("email", claims.Email)
+		c.Set(ContextEmailKey, claims.Email)
+		c.Next()
+	}
+}
 
+func unauthorized(c *gin.Context, msg string) {
+	c.Header("WWW-Authenticate", `Bearer realm="go-crud"`)
+	c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"message": msg})
+}
+
+// MaxBodySize limits request bodies to n bytes.
+func MaxBodySize(n int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, n)
 		c.Next()
 	}
 }

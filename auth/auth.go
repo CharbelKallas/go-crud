@@ -1,75 +1,101 @@
+// Package auth issues and validates the JWTs used by the API.
+//
+// Two kinds of token are issued: short-lived access tokens, accepted by the
+// API routes, and longer-lived refresh tokens, accepted only by the refresh
+// endpoint. The kind is stored in the "typ" claim so one can never be used
+// in place of the other.
 package auth
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt/v5"
 )
 
-type JwtWrapper struct {
-	SecretKey         string
-	Issuer            string
-	ExpirationMinutes int64
-	ExpirationHours   int64
+type TokenType string
+
+const (
+	AccessToken  TokenType = "access"
+	RefreshToken TokenType = "refresh"
+)
+
+// ErrInvalidToken is returned for any token that fails validation. The
+// underlying reason is wrapped for logging but should not be shown to
+// clients.
+var ErrInvalidToken = errors.New("invalid token")
+
+type Claims struct {
+	Email string    `json:"email"`
+	Type  TokenType `json:"typ"`
+	jwt.RegisteredClaims
 }
 
-type JwtClaim struct {
-	Email string
-	jwt.StandardClaims
+type TokenManager struct {
+	secret     []byte
+	issuer     string
+	accessTTL  time.Duration
+	refreshTTL time.Duration
+	now        func() time.Time
 }
 
-func (j *JwtWrapper) GenerateToken(email string) (signedToken string, err error) {
-	claims := &JwtClaim{
+func NewTokenManager(secret, issuer string, accessTTL, refreshTTL time.Duration) *TokenManager {
+	return &TokenManager{
+		secret:     []byte(secret),
+		issuer:     issuer,
+		accessTTL:  accessTTL,
+		refreshTTL: refreshTTL,
+		now:        time.Now,
+	}
+}
+
+// Generate signs a new token of the given type for the user.
+func (m *TokenManager) Generate(email string, typ TokenType) (string, error) {
+	var ttl time.Duration
+	switch typ {
+	case AccessToken:
+		ttl = m.accessTTL
+	case RefreshToken:
+		ttl = m.refreshTTL
+	default:
+		return "", fmt.Errorf("unknown token type %q", typ)
+	}
+
+	now := m.now()
+	claims := Claims{
 		Email: email,
-		StandardClaims: jwt.StandardClaims{
-			ExpiresAt: time.Now().Local().Add(time.Minute * time.Duration(j.ExpirationMinutes)).Unix(),
-			Issuer:    j.Issuer,
+		Type:  typ,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   email,
+			Issuer:    m.issuer,
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 		},
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signedToken, err = token.SignedString([]byte(j.SecretKey))
-	if err != nil {
-		return
-	}
-	return
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(m.secret)
 }
 
-func (j *JwtWrapper) RefreshToken(email string) (signedToken string, err error) {
-	claims := &JwtClaim{
-		Email: email,
-		StandardClaims: jwt.StandardClaims{
-			ExpiresAt: time.Now().Local().Add(time.Hour * time.Duration(j.ExpirationHours)).Unix(),
-			Issuer:    j.Issuer,
-		},
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signedToken, err = token.SignedString([]byte(j.SecretKey))
-	if err != nil {
-		return
-	}
-	return
-}
-
-func (j *JwtWrapper) ValidateToken(signedToken string) (claims *JwtClaim, err error) {
-	token, err := jwt.ParseWithClaims(
-		signedToken,
-		&JwtClaim{},
-		func(token *jwt.Token) (interface{}, error) {
-			return []byte(j.SecretKey), nil
-		},
+// Validate parses the token and checks its signature, algorithm, issuer,
+// expiry and type.
+func (m *TokenManager) Validate(signed string, want TokenType) (*Claims, error) {
+	claims := &Claims{}
+	_, err := jwt.ParseWithClaims(signed, claims,
+		func(*jwt.Token) (any, error) { return m.secret, nil },
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer(m.issuer),
+		jwt.WithExpirationRequired(),
+		jwt.WithTimeFunc(m.now),
 	)
 	if err != nil {
-		return
+		return nil, fmt.Errorf("%w: %w", ErrInvalidToken, err)
 	}
-	claims, ok := token.Claims.(*JwtClaim)
-	if !ok {
-		err = errors.New("couldn't parse claims")
-		return
+	if claims.Type != want {
+		return nil, fmt.Errorf("%w: expected %s token, got %q", ErrInvalidToken, want, claims.Type)
 	}
-	if claims.ExpiresAt < time.Now().Local().Unix() {
-		err = errors.New("JWT is expired")
-		return
+	if claims.Email == "" {
+		return nil, fmt.Errorf("%w: missing email", ErrInvalidToken)
 	}
-	return
+	return claims, nil
 }

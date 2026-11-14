@@ -1,2 +1,2 @@
-drop table recordings.user;
-drop table recordings.album;
+drop table if exists album;
+drop table if exists user;

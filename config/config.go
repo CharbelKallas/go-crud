@@ -1,0 +1,100 @@
+// Package config loads the application configuration from environment
+// variables. Secrets are never given defaults: the app refuses to start
+// when a required secret is missing or too weak.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
+)
+
+// MinJWTSecretLength is the minimum length, in bytes, of JWT_SECRET.
+// HS256 keys should be at least as long as the hash output (32 bytes).
+const MinJWTSecretLength = 32
+
+type Config struct {
+	HTTPAddr string
+
+	DBUser     string
+	DBPassword string
+	DBAddr     string
+	DBName     string
+	// MigrateOnStart applies the embedded SQL migrations at startup.
+	MigrateOnStart bool
+
+	JWTSecret       string
+	JWTIssuer       string
+	AccessTokenTTL  time.Duration
+	RefreshTokenTTL time.Duration
+	BcryptCost      int
+
+	// WeatherAPIKey is the weatherapi.com key. When empty the weather
+	// endpoint answers 503 instead of failing the whole app.
+	WeatherAPIKey     string
+	WeatherAPIBaseURL string
+	// Optional request-signing credentials for the weather API. The
+	// signing transport is only installed when both are set.
+	WeatherSigningSecret   string
+	WeatherSigningClientID string
+}
+
+// Load reads the configuration from the environment and validates it.
+func Load() (Config, error) {
+	var errs []error
+
+	cfg := Config{
+		HTTPAddr:               getenv("HTTP_ADDR", ":8080"),
+		DBUser:                 os.Getenv("DB_USERNAME"),
+		DBPassword:             os.Getenv("DB_PASSWORD"),
+		DBAddr:                 getenv("DATABASE_ADDR", "127.0.0.1:3306"),
+		DBName:                 getenv("DB_DATABASE", "recordings"),
+		JWTSecret:              os.Getenv("JWT_SECRET"),
+		JWTIssuer:              getenv("JWT_ISSUER", "go-crud"),
+		WeatherAPIKey:          os.Getenv("WEATHER_API_KEY"),
+		WeatherAPIBaseURL:      getenv("WEATHER_API_BASE_URL", "https://api.weatherapi.com/v1"),
+		WeatherSigningSecret:   os.Getenv("WEATHER_SIGNING_SECRET"),
+		WeatherSigningClientID: os.Getenv("WEATHER_SIGNING_CLIENT_ID"),
+	}
+
+	var err error
+	if cfg.MigrateOnStart, err = strconv.ParseBool(getenv("MIGRATE_ON_START", "true")); err != nil {
+		errs = append(errs, fmt.Errorf("MIGRATE_ON_START: %w", err))
+	}
+	if cfg.AccessTokenTTL, err = time.ParseDuration(getenv("ACCESS_TOKEN_TTL", "15m")); err != nil || cfg.AccessTokenTTL <= 0 {
+		errs = append(errs, fmt.Errorf("ACCESS_TOKEN_TTL must be a positive duration such as 15m"))
+	}
+	if cfg.RefreshTokenTTL, err = time.ParseDuration(getenv("REFRESH_TOKEN_TTL", "12h")); err != nil || cfg.RefreshTokenTTL <= 0 {
+		errs = append(errs, fmt.Errorf("REFRESH_TOKEN_TTL must be a positive duration such as 12h"))
+	}
+	if cfg.BcryptCost, err = strconv.Atoi(getenv("BCRYPT_COST", "12")); err != nil ||
+		cfg.BcryptCost < bcrypt.DefaultCost || cfg.BcryptCost > bcrypt.MaxCost {
+		errs = append(errs, fmt.Errorf("BCRYPT_COST must be an integer between %d and %d", bcrypt.DefaultCost, bcrypt.MaxCost))
+	}
+
+	if cfg.DBUser == "" {
+		errs = append(errs, errors.New("DB_USERNAME is required"))
+	}
+	if cfg.DBPassword == "" {
+		errs = append(errs, errors.New("DB_PASSWORD is required"))
+	}
+	if len(cfg.JWTSecret) < MinJWTSecretLength {
+		errs = append(errs, fmt.Errorf("JWT_SECRET is required and must be at least %d bytes (generate one with: openssl rand -base64 48)", MinJWTSecretLength))
+	}
+	if (cfg.WeatherSigningSecret == "") != (cfg.WeatherSigningClientID == "") {
+		errs = append(errs, errors.New("WEATHER_SIGNING_SECRET and WEATHER_SIGNING_CLIENT_ID must be set together"))
+	}
+
+	return cfg, errors.Join(errs...)
+}
+
+func getenv(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return fallback
+}

@@ -1,24 +1,50 @@
-version: '3'
+# Secrets come from a .env file next to this one (copy .env.example to .env
+# and fill it in). Compose refuses to start when a required value is missing.
+name: go-crud
 
 services:
   mysql:
-    image: mysql:latest
-    container_name: my-mysql-container
-    ports:
-      - "3307:3306"
+    image: mysql:8.4
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: charbelkallas
-      MYSQL_DATABASE: recordings
-      MYSQL_USER: charbelkallas
-      MYSQL_PASSWORD: charbelkallas
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${DB_DATABASE:-recordings}
+      MYSQL_USER: ${DB_USERNAME:?set DB_USERNAME in .env}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    # Published on the loopback interface only, for local tools and the
+    # integration tests.
+    ports:
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # No credentials needed: ping succeeds as soon as the server accepts
+      # TCP connections, which the init-time temporary server does not.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
 
   app:
-    container_name: go-crud
     build: .
+    restart: unless-stopped
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
     environment:
-      DB_USERNAME: charbelkallas
-      DB_PASSWORD: charbelkallas
-      DB_DATABASE: recordings
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_DATABASE: ${DB_DATABASE:-recordings}
       DATABASE_ADDR: mysql:3306
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-15m}
+      REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL:-12h}
+      WEATHER_API_KEY: ${WEATHER_API_KEY:-}
+      WEATHER_SIGNING_SECRET: ${WEATHER_SIGNING_SECRET:-}
+      WEATHER_SIGNING_CLIENT_ID: ${WEATHER_SIGNING_CLIENT_ID:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  mysql-data:
