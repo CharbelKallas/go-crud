@@ -28,7 +28,10 @@ services:
 
   app:
     build: .
-    restart: unless-stopped
+    # Retry a few times (e.g. a transient DB hiccup), then stay stopped so a
+    # persistent startup error such as a failed migration is visible in
+    # `docker compose ps` instead of looping forever.
+    restart: on-failure:3
     depends_on:
       mysql:
         condition: service_healthy
@@ -40,6 +43,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-15m}
       REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL:-12h}
+      AUTH_RATE_LIMIT_PER_MINUTE: ${AUTH_RATE_LIMIT_PER_MINUTE:-10}
       WEATHER_API_KEY: ${WEATHER_API_KEY:-}
       WEATHER_SIGNING_SECRET: ${WEATHER_SIGNING_SECRET:-}
       WEATHER_SIGNING_CLIENT_ID: ${WEATHER_SIGNING_CLIENT_ID:-}

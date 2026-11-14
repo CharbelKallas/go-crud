@@ -19,6 +19,9 @@ type Deps struct {
 	Albums  *handlers.AlbumHandler
 	Weather *handlers.WeatherHandler
 	DB      handlers.Pinger
+	// AuthRateLimitPerMinute limits the /api/auth routes per client IP;
+	// 0 disables the limit (tests).
+	AuthRateLimitPerMinute int
 }
 
 func New(d Deps) *gin.Engine {
@@ -36,6 +39,9 @@ func New(d Deps) *gin.Engine {
 	api := r.Group("/api")
 
 	public := api.Group("/auth")
+	if d.AuthRateLimitPerMinute > 0 {
+		public.Use(middlewares.NewIPRateLimiter(d.AuthRateLimitPerMinute).Middleware())
+	}
 	public.POST("/login", d.Auth.Login)
 	public.POST("/signup", d.Auth.Signup)
 	public.POST("/refresh", d.Auth.Refresh)

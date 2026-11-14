@@ -52,7 +52,7 @@ func run() error {
 	}
 
 	tokens := auth.NewTokenManager(cfg.JWTSecret, cfg.JWTIssuer, cfg.AccessTokenTTL, cfg.RefreshTokenTTL)
-	authHandler, err := handlers.NewAuthHandler(repositories.NewUserRepository(db), tokens, cfg.BcryptCost)
+	authHandler, err := handlers.NewAuthHandler(repositories.NewUserRepository(db), repositories.NewRefreshTokenRepository(db), tokens, cfg.BcryptCost)
 	if err != nil {
 		return err
 	}
@@ -74,6 +74,8 @@ func run() error {
 		Albums:  handlers.NewAlbumHandler(repositories.NewAlbumRepository(db)),
 		Weather: handlers.NewWeatherHandler(weatherProvider),
 		DB:      db,
+
+		AuthRateLimitPerMinute: cfg.AuthRateLimitPerMinute,
 	})
 
 	srv := &http.Server{

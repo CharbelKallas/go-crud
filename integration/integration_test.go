@@ -74,7 +74,7 @@ func TestMain(m *testing.M) {
 
 func reset(t *testing.T) {
 	t.Helper()
-	for _, table := range []string{"album", "user"} {
+	for _, table := range []string{"refresh_token", "album", "user"} {
 		if _, err := testDB.Exec("DELETE FROM " + table); err != nil {
 			t.Fatal(err)
 		}
@@ -156,7 +156,7 @@ func TestEndToEnd(t *testing.T) {
 	reset(t)
 	gin.SetMode(gin.TestMode)
 	tokens := auth.NewTokenManager(testCfg.JWTSecret, testCfg.JWTIssuer, time.Minute, time.Hour)
-	authHandler, err := handlers.NewAuthHandler(repositories.NewUserRepository(testDB), tokens, bcrypt.DefaultCost)
+	authHandler, err := handlers.NewAuthHandler(repositories.NewUserRepository(testDB), repositories.NewRefreshTokenRepository(testDB), tokens, bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,6 +236,70 @@ func TestEndToEnd(t *testing.T) {
 	var refreshed handlers.LoginResponse
 	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": login.RefreshToken}, 200, &refreshed)
 	call("GET", "/api/albums", refreshed.Token, nil, 200, nil)
+
+	// Reusing a refresh token revokes the whole family.
+	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": login.RefreshToken}, 401, nil)
+	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": refreshed.RefreshToken}, 401, nil)
+
+	// A fresh login works again.
+	var again handlers.LoginResponse
+	call("POST", "/api/auth/login", "", map[string]string{"email": "ann@example.com", "password": "correct horse"}, 200, &again)
+	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": again.RefreshToken}, 200, nil)
+}
+
+func TestRefreshTokenRepository(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	users := repositories.NewUserRepository(testDB)
+	repo := repositories.NewRefreshTokenRepository(testDB)
+	if err := users.Create(ctx, models.User{Name: "A", Email: "a@example.com", Password: "h"}); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := users.GetByEmail(ctx, "a@example.com")
+
+	future := time.Now().Add(time.Hour)
+	for _, id := range []string{"t1", "t2"} {
+		if err := repo.Save(ctx, id, u.ID, future); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.Consume(ctx, "t1", u.ID+1); !errors.Is(err, repositories.ErrNotFound) {
+		t.Fatalf("other user's token: %v", err)
+	}
+	if err := repo.Consume(ctx, "t1", u.ID); err != nil {
+		t.Fatalf("first use: %v", err)
+	}
+	if err := repo.Consume(ctx, "t1", u.ID); !errors.Is(err, repositories.ErrTokenReused) {
+		t.Fatalf("second use: %v", err)
+	}
+	if err := repo.Consume(ctx, "t2", u.ID); !errors.Is(err, repositories.ErrTokenReused) {
+		t.Fatalf("sibling not revoked: %v", err)
+	}
+	if err := repo.Consume(ctx, "nope", u.ID); !errors.Is(err, repositories.ErrNotFound) {
+		t.Fatalf("unknown: %v", err)
+	}
+
+	// Expired rows are pruned on the next save.
+	if err := repo.Save(ctx, "old", u.ID, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Save(ctx, "t3", u.ID, future); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	testDB.QueryRow("SELECT COUNT(*) FROM refresh_token WHERE jti = 'old'").Scan(&n)
+	if n != 0 {
+		t.Fatal("expired token not pruned")
+	}
+
+	// Deleting the user deletes their tokens.
+	if _, err := testDB.Exec("DELETE FROM user WHERE id = ?", u.ID); err != nil {
+		t.Fatal(err)
+	}
+	testDB.QueryRow("SELECT COUNT(*) FROM refresh_token").Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d tokens left after user deletion", n)
+	}
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }

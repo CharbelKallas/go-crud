@@ -12,7 +12,7 @@ import (
 func setValidEnv(t *testing.T) {
 	for _, k := range []string{
 		"HTTP_ADDR", "DATABASE_ADDR", "DB_DATABASE", "MIGRATE_ON_START", "JWT_ISSUER",
-		"ACCESS_TOKEN_TTL", "REFRESH_TOKEN_TTL", "BCRYPT_COST", "WEATHER_API_KEY",
+		"ACCESS_TOKEN_TTL", "REFRESH_TOKEN_TTL", "BCRYPT_COST", "AUTH_RATE_LIMIT_PER_MINUTE", "WEATHER_API_KEY",
 		"WEATHER_API_BASE_URL", "WEATHER_SIGNING_SECRET", "WEATHER_SIGNING_CLIENT_ID",
 	} {
 		t.Setenv(k, "")
@@ -29,7 +29,7 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.HTTPAddr != ":8080" || cfg.AccessTokenTTL != 15*time.Minute || cfg.RefreshTokenTTL != 12*time.Hour ||
-		cfg.BcryptCost != 12 || !cfg.MigrateOnStart || !strings.HasPrefix(cfg.WeatherAPIBaseURL, "https://") {
+		cfg.BcryptCost != 12 || cfg.AuthRateLimitPerMinute != 10 || !cfg.MigrateOnStart || !strings.HasPrefix(cfg.WeatherAPIBaseURL, "https://") {
 		t.Errorf("unexpected defaults: %+v", cfg)
 	}
 }
@@ -41,6 +41,7 @@ func TestLoadRejectsMissingOrWeakSecrets(t *testing.T) {
 		"no db password":   func(t *testing.T) { t.Setenv("DB_PASSWORD", "") },
 		"bad ttl":          func(t *testing.T) { t.Setenv("ACCESS_TOKEN_TTL", "-1m") },
 		"low bcrypt cost":  func(t *testing.T) { t.Setenv("BCRYPT_COST", "4") },
+		"zero rate limit":  func(t *testing.T) { t.Setenv("AUTH_RATE_LIMIT_PER_MINUTE", "0") },
 		"half signing cfg": func(t *testing.T) { t.Setenv("WEATHER_SIGNING_SECRET", "s") },
 	}
 	for name, mutate := range tests {

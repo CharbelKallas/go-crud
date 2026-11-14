@@ -7,6 +7,8 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -50,8 +52,22 @@ func NewTokenManager(secret, issuer string, accessTTL, refreshTTL time.Duration)
 	}
 }
 
+// Issued is a signed token with the identifiers needed to track it.
+type Issued struct {
+	Token     string
+	ID        string // the "jti" claim
+	ExpiresAt time.Time
+}
+
 // Generate signs a new token of the given type for the user.
 func (m *TokenManager) Generate(email string, typ TokenType) (string, error) {
+	issued, err := m.Issue(email, typ)
+	return issued.Token, err
+}
+
+// Issue signs a new token of the given type and returns it with its unique
+// ID and expiry, so refresh tokens can be recorded server-side.
+func (m *TokenManager) Issue(email string, typ TokenType) (Issued, error) {
 	var ttl time.Duration
 	switch typ {
 	case AccessToken:
@@ -59,22 +75,34 @@ func (m *TokenManager) Generate(email string, typ TokenType) (string, error) {
 	case RefreshToken:
 		ttl = m.refreshTTL
 	default:
-		return "", fmt.Errorf("unknown token type %q", typ)
+		return Issued{}, fmt.Errorf("unknown token type %q", typ)
 	}
 
+	idBytes := make([]byte, 16)
+	if _, err := rand.Read(idBytes); err != nil {
+		return Issued{}, fmt.Errorf("token id: %w", err)
+	}
+	id := hex.EncodeToString(idBytes)
+
 	now := m.now()
+	expiresAt := now.Add(ttl)
 	claims := Claims{
 		Email: email,
 		Type:  typ,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        id,
 			Subject:   email,
 			Issuer:    m.issuer,
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			ExpiresAt: jwt.NewNumericDate(expiresAt),
 		},
 	}
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(m.secret)
+	signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(m.secret)
+	if err != nil {
+		return Issued{}, err
+	}
+	return Issued{Token: signed, ID: id, ExpiresAt: expiresAt}, nil
 }
 
 // Validate parses the token and checks its signature, algorithm, issuer,
@@ -93,6 +121,9 @@ func (m *TokenManager) Validate(signed string, want TokenType) (*Claims, error) 
 	}
 	if claims.Type != want {
 		return nil, fmt.Errorf("%w: expected %s token, got %q", ErrInvalidToken, want, claims.Type)
+	}
+	if claims.ID == "" {
+		return nil, fmt.Errorf("%w: missing jti", ErrInvalidToken)
 	}
 	if claims.Email == "" {
 		return nil, fmt.Errorf("%w: missing email", ErrInvalidToken)

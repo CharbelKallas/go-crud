@@ -9,7 +9,7 @@ A small REST API in Go ([Gin](https://github.com/gin-gonic/gin) + MySQL):
 ## Run with Docker (recommended)
 
 ```bash
-cp .env.example .env    # then replace every value in .env
+cp .env.example .env    # then fill in the empty secrets in .env
 docker compose up --build
 ```
 
@@ -17,7 +17,7 @@ The API listens on http://localhost:8080. MySQL is published on `127.0.0.1:3307`
 
 ## Run locally
 
-Requires Go 1.26+ and a MySQL 8 server.
+Requires Go 1.26.10+ (the version in `go.mod`) and a MySQL 8 server.
 
 ```bash
 docker compose up -d mysql
@@ -38,6 +38,7 @@ All configuration comes from environment variables. The app refuses to start if 
 | `JWT_ISSUER` | | `go-crud` | |
 | `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL` | | `15m` / `12h` | Go durations |
 | `BCRYPT_COST` | | `12` | 10–31 |
+| `AUTH_RATE_LIMIT_PER_MINUTE` | | `10` | Requests per client IP per minute to `/api/auth/*`; over the limit answers 429 |
 | `HTTP_ADDR` | | `:8080` | |
 | `MIGRATE_ON_START` | | `true` | |
 | `WEATHER_API_KEY` | | | Without it `/api/weather` answers 503 |
@@ -46,13 +47,15 @@ All configuration comes from environment variables. The app refuses to start if 
 
 ## API
 
-Protected routes need `Authorization: Bearer <Token>` using the **access** token from login. The refresh token is only accepted by `/api/auth/refresh`.
+Protected routes need `Authorization: Bearer <Token>` using the **access** token from login. The refresh token is only accepted by `/api/auth/refresh`, and **each refresh token works once**: always store the new pair it returns. Presenting a refresh token a second time is treated as theft and revokes all of that user's refresh tokens, so the user must log in again (clients must not refresh concurrently with the same token).
+
+`/api/auth/*` is rate-limited per client IP (`AUTH_RATE_LIMIT_PER_MINUTE`, 429 with `Retry-After` when exceeded). The limit is kept in memory per app instance.
 
 | Method | Path | Success | Errors |
 |---|---|---|---|
 | POST | `/api/auth/signup` `{"name","email","password"}` | 201 `{"Message": ...}` | 400 invalid input (password 8–72 bytes), 409 email taken |
 | POST | `/api/auth/login` `{"email","password"}` | 200 `{"Token","RefreshToken"}` | 400, 401 |
-| POST | `/api/auth/refresh` `{"RefreshToken"}` | 200 `{"Token","RefreshToken"}` | 400, 401 |
+| POST | `/api/auth/refresh` `{"RefreshToken"}` | 200 `{"Token","RefreshToken"}` | 400, 401 (invalid, expired or already used) |
 | GET | `/api/albums` | 200 `[album...]` (`[]` when empty) | 401 |
 | GET | `/api/albums/:id` | 200 `album` | 400 bad id, 404 |
 | GET | `/api/albums/artist/:artist` | 200 `[album...]` | 401 |
@@ -72,7 +75,7 @@ A Postman collection is in [`postman/`](postman/go-crud.postman_collection.json)
 go test -race ./...
 ```
 
-Integration tests run the repositories and the whole HTTP API against a real MySQL. **They delete every row in the `user` and `album` tables**, so they only run when `INTEGRATION_ALLOW_DB_RESET=1` is set; point them at a disposable database:
+Integration tests run the repositories and the whole HTTP API against a real MySQL. **They delete every row in the `user`, `album` and `refresh_token` tables**, so they only run when `INTEGRATION_ALLOW_DB_RESET=1` is set; point them at a disposable database:
 
 ```bash
 docker compose up -d mysql

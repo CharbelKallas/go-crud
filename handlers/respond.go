@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -79,12 +80,21 @@ func describeBindError(err error) string {
 		case "email":
 			msgs = append(msgs, fe.Field()+" must be a valid email address")
 		case "min", "gte":
-			msgs = append(msgs, fmt.Sprintf("%s must be at least %s", fe.Field(), fe.Param()))
+			msgs = append(msgs, fmt.Sprintf("%s must be at least %s%s", fe.Field(), fe.Param(), lengthUnit(fe)))
 		case "max", "lte":
-			msgs = append(msgs, fmt.Sprintf("%s must be at most %s", fe.Field(), fe.Param()))
+			msgs = append(msgs, fmt.Sprintf("%s must be at most %s%s", fe.Field(), fe.Param(), lengthUnit(fe)))
 		default:
 			msgs = append(msgs, fe.Field()+" is invalid")
 		}
 	}
 	return strings.Join(msgs, "; ")
+}
+
+// lengthUnit names the unit of a min/max rule: on strings the validator
+// counts characters, on numbers it compares the value.
+func lengthUnit(fe validator.FieldError) string {
+	if fe.Kind() == reflect.String {
+		return " characters"
+	}
+	return ""
 }

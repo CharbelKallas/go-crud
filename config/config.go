@@ -32,6 +32,9 @@ type Config struct {
 	AccessTokenTTL  time.Duration
 	RefreshTokenTTL time.Duration
 	BcryptCost      int
+	// AuthRateLimitPerMinute is how many login/signup/refresh requests
+	// one client IP may make per minute.
+	AuthRateLimitPerMinute int
 
 	// WeatherAPIKey is the weatherapi.com key. When empty the weather
 	// endpoint answers 503 instead of failing the whole app.
@@ -74,6 +77,11 @@ func Load() (Config, error) {
 	if cfg.BcryptCost, err = strconv.Atoi(getenv("BCRYPT_COST", "12")); err != nil ||
 		cfg.BcryptCost < bcrypt.DefaultCost || cfg.BcryptCost > bcrypt.MaxCost {
 		errs = append(errs, fmt.Errorf("BCRYPT_COST must be an integer between %d and %d", bcrypt.DefaultCost, bcrypt.MaxCost))
+	}
+
+	if cfg.AuthRateLimitPerMinute, err = strconv.Atoi(getenv("AUTH_RATE_LIMIT_PER_MINUTE", "10")); err != nil ||
+		cfg.AuthRateLimitPerMinute < 1 || cfg.AuthRateLimitPerMinute > 10_000 {
+		errs = append(errs, errors.New("AUTH_RATE_LIMIT_PER_MINUTE must be an integer between 1 and 10000"))
 	}
 
 	if cfg.DBUser == "" {

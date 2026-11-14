@@ -149,6 +149,44 @@ func (f *fakeWeather) Current(_ context.Context, lat, lon float64) (models.Weath
 	return models.WeatherResponse{Location: models.LocationInfo{Name: "Beirut"}}, nil
 }
 
+type fakeRefresh struct {
+	mu     sync.Mutex
+	tokens map[string]*fakeRefreshRow
+}
+
+type fakeRefreshRow struct {
+	userID        int64
+	used, revoked bool
+}
+
+func newFakeRefresh() *fakeRefresh { return &fakeRefresh{tokens: map[string]*fakeRefreshRow{}} }
+
+func (f *fakeRefresh) Save(_ context.Context, id string, userID int64, _ time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tokens[id] = &fakeRefreshRow{userID: userID}
+	return nil
+}
+
+func (f *fakeRefresh) Consume(_ context.Context, id string, userID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.tokens[id]
+	if !ok || row.userID != userID {
+		return repositories.ErrNotFound
+	}
+	if row.used || row.revoked {
+		for _, r := range f.tokens {
+			if r.userID == userID {
+				r.revoked = true
+			}
+		}
+		return repositories.ErrTokenReused
+	}
+	row.used = true
+	return nil
+}
+
 type fakePinger struct{ err error }
 
 func (f fakePinger) PingContext(context.Context) error { return f.err }
@@ -160,6 +198,7 @@ type harness struct {
 	engine  *gin.Engine
 	tokens  *auth.TokenManager
 	users   *fakeUsers
+	refresh *fakeRefresh
 	albums  *fakeAlbums
 	weather *fakeWeather
 }
@@ -171,10 +210,11 @@ func newHarness(t *testing.T) *harness {
 		t:       t,
 		tokens:  auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", 15*time.Minute, time.Hour),
 		users:   &fakeUsers{users: map[string]models.User{}},
+		refresh: newFakeRefresh(),
 		albums:  &fakeAlbums{albums: map[int64]models.Album{}},
 		weather: &fakeWeather{},
 	}
-	authHandler, err := handlers.NewAuthHandler(h.users, h.tokens, bcrypt.MinCost)
+	authHandler, err := handlers.NewAuthHandler(h.users, h.refresh, h.tokens, bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,6 +299,16 @@ func TestSignupLoginRefresh(t *testing.T) {
 	var refreshed handlers.LoginResponse
 	decode(t, rec, &refreshed)
 	expect(t, h.do("GET", "/api/albums", refreshed.Token, nil), http.StatusOK)
+
+	// A refresh token works once. Reusing it is treated as theft: it is
+	// rejected and every refresh token of the user is revoked, including
+	// the one just issued.
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": tokens.RefreshToken}), http.StatusUnauthorized)
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": refreshed.RefreshToken}), http.StatusUnauthorized)
+
+	// A validly signed refresh token that was never issued is rejected.
+	unknown, _ := h.tokens.Generate("ann@example.com", auth.RefreshToken)
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": unknown}), http.StatusUnauthorized)
 
 	// A refresh token for a user that no longer exists is rejected.
 	ghost, _ := h.tokens.Generate("ghost@example.com", auth.RefreshToken)
@@ -448,6 +498,22 @@ func TestAlbumValidation(t *testing.T) {
 	expect(t, h.do("POST", "/api/albums", tok, big), http.StatusBadRequest)
 }
 
+func TestValidationMessages(t *testing.T) {
+	h := newHarness(t)
+	tok := h.login().Token
+	for body, want := range map[string]string{
+		`{"title":"` + strings.Repeat("t", 129) + `","artist":"a","price":1}`: "Title must be at most 128 characters",
+		`{"title":"t","artist":"a","price":1000}`:                             "Price must be at most 999.99",
+	} {
+		rec := h.do("POST", "/api/albums", tok, body)
+		var e struct{ Message string }
+		decode(t, rec, &e)
+		if e.Message != want {
+			t.Errorf("message = %q, want %q", e.Message, want)
+		}
+	}
+}
+
 func TestInternalErrorsAreHidden(t *testing.T) {
 	h := newHarness(t)
 	tok := h.login().Token
@@ -482,7 +548,7 @@ func TestWeather(t *testing.T) {
 func TestWeatherNotConfigured(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", time.Minute, time.Hour)
-	authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, tokens, bcrypt.MinCost)
+	authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, newFakeRefresh(), tokens, bcrypt.MinCost)
 	engine := router.New(router.Deps{
 		Tokens: tokens, Auth: authHandler, DB: fakePinger{},
 		Albums:  handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
@@ -494,6 +560,27 @@ func TestWeatherNotConfigured(t *testing.T) {
 	rec := httptest.NewRecorder()
 	engine.ServeHTTP(rec, req)
 	expect(t, rec, http.StatusServiceUnavailable)
+}
+
+func TestAuthRoutesAreRateLimited(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", time.Minute, time.Hour)
+	authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, newFakeRefresh(), tokens, bcrypt.MinCost)
+	engine := router.New(router.Deps{
+		Tokens: tokens, Auth: authHandler, DB: fakePinger{},
+		Albums:                 handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
+		Weather:                handlers.NewWeatherHandler(nil),
+		AuthRateLimitPerMinute: 2,
+	})
+	var codes []int
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"email":"a@example.com","password":"x"}`)))
+		codes = append(codes, rec.Code)
+	}
+	if codes[0] != http.StatusUnauthorized || codes[1] != http.StatusUnauthorized || codes[2] != http.StatusTooManyRequests {
+		t.Fatalf("codes = %v", codes)
+	}
 }
 
 func TestHealth(t *testing.T) {

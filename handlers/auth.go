@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -25,8 +26,16 @@ type UserStore interface {
 	UpdatePasswordHash(ctx context.Context, id int64, hash string) error
 }
 
+// RefreshTokenStore tracks issued refresh tokens (see
+// repositories.RefreshTokenRepository).
+type RefreshTokenStore interface {
+	Save(ctx context.Context, id string, userID int64, expiresAt time.Time) error
+	Consume(ctx context.Context, id string, userID int64) error
+}
+
 type AuthHandler struct {
 	users      UserStore
+	refresh    RefreshTokenStore
 	tokens     *auth.TokenManager
 	bcryptCost int
 	// dummyHash is compared against when the user does not exist, so a
@@ -35,12 +44,12 @@ type AuthHandler struct {
 	dummyHash string
 }
 
-func NewAuthHandler(users UserStore, tokens *auth.TokenManager, bcryptCost int) (*AuthHandler, error) {
+func NewAuthHandler(users UserStore, refresh RefreshTokenStore, tokens *auth.TokenManager, bcryptCost int) (*AuthHandler, error) {
 	dummy, err := bcrypt.GenerateFromPassword([]byte("timing-equalisation-dummy"), bcryptCost)
 	if err != nil {
 		return nil, err
 	}
-	return &AuthHandler{users: users, tokens: tokens, bcryptCost: bcryptCost, dummyHash: string(dummy)}, nil
+	return &AuthHandler{users: users, refresh: refresh, tokens: tokens, bcryptCost: bcryptCost, dummyHash: string(dummy)}, nil
 }
 
 type SignupPayload struct {
@@ -121,10 +130,12 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 	h.upgradeHash(c.Request.Context(), user, p.Password)
-	h.issueTokens(c, user.Email)
+	h.issueTokens(c, user)
 }
 
 // Refresh exchanges a valid refresh token for a new access/refresh pair.
+// Each refresh token works once; presenting a used one revokes all of the
+// user's refresh tokens (the token was probably stolen).
 func (h *AuthHandler) Refresh(c *gin.Context) {
 	var p RefreshPayload
 	if !bindJSON(c, &p) {
@@ -146,7 +157,20 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		respondInternal(c, err)
 		return
 	}
-	h.issueTokens(c, user.Email)
+
+	switch err := h.refresh.Consume(c.Request.Context(), claims.ID, user.ID); {
+	case errors.Is(err, repositories.ErrTokenReused):
+		slog.WarnContext(c.Request.Context(), "refresh token reused; revoked all refresh tokens of the user", "user_id", user.ID)
+		respondError(c, http.StatusUnauthorized, "invalid refresh token")
+		return
+	case errors.Is(err, repositories.ErrNotFound):
+		respondError(c, http.StatusUnauthorized, "invalid refresh token")
+		return
+	case err != nil:
+		respondInternal(c, err)
+		return
+	}
+	h.issueTokens(c, user)
 }
 
 // upgradeHash re-hashes the password when it was stored with a different
@@ -166,16 +190,20 @@ func (h *AuthHandler) upgradeHash(ctx context.Context, user models.User, passwor
 	}
 }
 
-func (h *AuthHandler) issueTokens(c *gin.Context, email string) {
-	access, err := h.tokens.Generate(email, auth.AccessToken)
+func (h *AuthHandler) issueTokens(c *gin.Context, user models.User) {
+	access, err := h.tokens.Generate(user.Email, auth.AccessToken)
 	if err != nil {
 		respondInternal(c, err)
 		return
 	}
-	refresh, err := h.tokens.Generate(email, auth.RefreshToken)
+	refresh, err := h.tokens.Issue(user.Email, auth.RefreshToken)
 	if err != nil {
 		respondInternal(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, LoginResponse{Token: access, RefreshToken: refresh})
+	if err := h.refresh.Save(c.Request.Context(), refresh.ID, user.ID, refresh.ExpiresAt); err != nil {
+		respondInternal(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, LoginResponse{Token: access, RefreshToken: refresh.Token})
 }

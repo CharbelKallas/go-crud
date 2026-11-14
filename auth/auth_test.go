@@ -25,9 +25,25 @@ func TestGenerateAndValidate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("validate %s: %v", typ, err)
 		}
-		if claims.Email != "a@example.com" || claims.Subject != "a@example.com" || claims.Type != typ {
+		if claims.Email != "a@example.com" || claims.Subject != "a@example.com" || claims.Type != typ || len(claims.ID) != 32 {
 			t.Errorf("unexpected claims %+v", claims)
 		}
+	}
+}
+
+func TestIssueReturnsUniqueIDs(t *testing.T) {
+	m := newManager()
+	a, err := m.Issue("a@example.com", RefreshToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := m.Issue("a@example.com", RefreshToken)
+	if a.ID == b.ID || a.Token == b.Token {
+		t.Fatal("tokens issued in the same second are identical")
+	}
+	claims, err := m.Validate(a.Token, RefreshToken)
+	if err != nil || claims.ID != a.ID || !claims.ExpiresAt.Time.Equal(a.ExpiresAt.Truncate(time.Second)) {
+		t.Fatalf("claims = %+v, issued = %+v, err = %v", claims, a, err)
 	}
 }
 
@@ -71,7 +87,7 @@ func TestWrongIssuerRejected(t *testing.T) {
 
 func TestOtherAlgorithmsRejected(t *testing.T) {
 	claims := Claims{Email: "a@example.com", Type: AccessToken, RegisteredClaims: jwt.RegisteredClaims{
-		Issuer: "go-crud-test", ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		ID: "id", Issuer: "go-crud-test", ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
 	}}
 	none, err := jwt.NewWithClaims(jwt.SigningMethodNone, claims).SignedString(jwt.UnsafeAllowNoneSignatureType)
 	if err != nil {
@@ -86,7 +102,7 @@ func TestOtherAlgorithmsRejected(t *testing.T) {
 }
 
 func TestTokenWithoutExpiryRejected(t *testing.T) {
-	claims := Claims{Email: "a@example.com", Type: AccessToken, RegisteredClaims: jwt.RegisteredClaims{Issuer: "go-crud-test"}}
+	claims := Claims{Email: "a@example.com", Type: AccessToken, RegisteredClaims: jwt.RegisteredClaims{ID: "id", Issuer: "go-crud-test"}}
 	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(testSecret))
 	if _, err := newManager().Validate(tok, AccessToken); !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("token without exp accepted: %v", err)
