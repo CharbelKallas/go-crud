@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"reflect"
@@ -49,8 +50,15 @@ func bindJSON(c *gin.Context, dst any) bool {
 		respondError(c, http.StatusBadRequest, "invalid JSON body")
 		return false
 	}
-	if err := json.NewDecoder(c.Request.Body).Decode(dst); err != nil {
+	dec := json.NewDecoder(c.Request.Body)
+	if err := dec.Decode(dst); err != nil {
 		respondError(c, http.StatusBadRequest, describeBindError(err))
+		return false
+	}
+	// The body must be exactly one JSON value (trailing whitespace is fine).
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		respondError(c, http.StatusBadRequest, "invalid JSON body: unexpected data after the JSON object")
 		return false
 	}
 	if n, ok := dst.(normalizer); ok {
@@ -69,6 +77,11 @@ func describeBindError(err error) string {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			return "request body too large"
+		}
+		// Names the field as the client spelled it, e.g. "price".
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) && typeErr.Field != "" {
+			return typeErr.Field + " must be " + jsonKind(typeErr.Type.Kind())
 		}
 		return "invalid JSON body"
 	}
@@ -97,4 +110,20 @@ func lengthUnit(fe validator.FieldError) string {
 		return " characters"
 	}
 	return ""
+}
+
+// jsonKind describes the JSON value expected for a Go kind.
+func jsonKind(k reflect.Kind) string {
+	switch k {
+	case reflect.String:
+		return "a string"
+	case reflect.Bool:
+		return "true or false"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return "a number"
+	default:
+		return "a different type"
+	}
 }

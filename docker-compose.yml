@@ -46,9 +46,11 @@ services:
   # has succeeded, so a failed migration stops `docker compose up` with a
   # clear error instead of crash-looping the API.
   migrate:
-    # Uses the image the app service builds; never pulled from a registry.
+    # Builds the image the app also uses. The build lives here because the
+    # app depends on this service, so `docker compose up`, `run app` and
+    # `run migrate` all build it, and only once.
     image: go-crud:local
-    pull_policy: never
+    build: .
     command: ["migrate"]
     restart: "no"
     depends_on:
@@ -57,8 +59,9 @@ services:
     environment: *app-env
 
   app:
+    # Built by the migrate service; never pulled from a registry.
     image: go-crud:local
-    build: .
+    pull_policy: never
     # Comes back after a crash or a Docker/host restart. Migrations are not
     # re-run on those restarts; the `migrate` service owns them.
     restart: unless-stopped

@@ -179,10 +179,10 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	rotated, err := h.refresh.Rotate(c.Request.Context(), claims.ID, user.ID, refresh.ID, refresh.ExpiresAt)
 	switch {
 	case errors.Is(err, repositories.ErrTokenReused):
-		slog.WarnContext(c.Request.Context(), "refresh token reused; revoked all refresh tokens of the user", "user_id", user.ID)
+		slog.WarnContext(c.Request.Context(), "refresh token reused; revoked all sessions of the user", "user_id", user.ID)
 		respondError(c, http.StatusUnauthorized, "invalid refresh token")
 		return
-	case errors.Is(err, repositories.ErrNotFound):
+	case errors.Is(err, repositories.ErrNotFound), errors.Is(err, repositories.ErrTokenRevoked):
 		respondError(c, http.StatusUnauthorized, "invalid refresh token")
 		return
 	case err != nil:

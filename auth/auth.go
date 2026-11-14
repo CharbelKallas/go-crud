@@ -16,6 +16,13 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+func init() {
+	// Encode iat/exp/nbf with millisecond precision (RFC 7519 allows
+	// fractional NumericDates) so an access token can be compared exactly
+	// with a session revocation time.
+	jwt.TimePrecision = time.Millisecond
+}
+
 type TokenType string
 
 const (

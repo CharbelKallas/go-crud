@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // pruneInterval is how often Save also deletes expired rows.
@@ -57,13 +59,39 @@ type Rotated struct {
 // and the replayer then hold the same token, and whichever presents it
 // second triggers reuse detection.
 //
-// It returns ErrNotFound for an unknown token. For a token that was
-// already used (outside the grace window), revoked or expired it revokes
-// every refresh token of the user and returns ErrTokenReused.
+// It returns ErrNotFound for an unknown or expired token and
+// ErrTokenRevoked for a token that was already revoked; neither changes
+// anything. For a token that was already used (outside the grace window)
+// it revokes every session of the user (see RevokeAll) and returns
+// ErrTokenReused.
+//
+// The transaction is retried when MySQL aborts it to break a deadlock.
 func (r *RefreshTokenRepository) Rotate(ctx context.Context, oldID string, userID int64, newID string, newExpiresAt time.Time) (Rotated, error) {
+	var (
+		rotated Rotated
+		reused  bool
+	)
+	err := retryOnDeadlock(func() (err error) {
+		rotated, reused, err = r.rotateTx(ctx, oldID, userID, newID, newExpiresAt)
+		return err
+	})
+	if err != nil {
+		return Rotated{}, err
+	}
+	if reused {
+		// Outside the transaction, so its row locks are already released.
+		if err := r.RevokeAll(ctx, userID); err != nil {
+			return Rotated{}, err
+		}
+		return Rotated{}, ErrTokenReused
+	}
+	return rotated, nil
+}
+
+func (r *RefreshTokenRepository) rotateTx(ctx context.Context, oldID string, userID int64, newID string, newExpiresAt time.Time) (rotated Rotated, reused bool, err error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
+		return Rotated{}, false, fmt.Errorf("rotate refresh token: %w", err)
 	}
 	defer tx.Rollback()
 
@@ -72,8 +100,8 @@ func (r *RefreshTokenRepository) Rotate(ctx context.Context, oldID string, userI
 		used, revoked, live, inGrace bool
 		replacedBy                   sql.NullString
 	)
-	// Time comparisons run in the database so app/DB clock skew does not
-	// matter. FOR UPDATE serialises concurrent rotations of the same token.
+	// Time comparisons run in the database. FOR UPDATE serialises
+	// concurrent rotations of the same token.
 	err = tx.QueryRowContext(ctx, `SELECT used_at IS NOT NULL, revoked_at IS NOT NULL,
 			expires_at > UTC_TIMESTAMP(),
 			COALESCE(? > 0 AND used_at >= UTC_TIMESTAMP() - INTERVAL ? SECOND, FALSE),
@@ -81,27 +109,34 @@ func (r *RefreshTokenRepository) Rotate(ctx context.Context, oldID string, userI
 		FROM refresh_token WHERE jti = ? AND user_id = ? FOR UPDATE`,
 		graceSeconds, graceSeconds, oldID, userID).Scan(&used, &revoked, &live, &inGrace, &replacedBy)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Rotated{}, ErrNotFound
+		return Rotated{}, false, ErrNotFound
 	}
 	if err != nil {
-		return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
+		return Rotated{}, false, fmt.Errorf("rotate refresh token: %w", err)
 	}
 
 	switch {
-	case !used && !revoked && live:
+	case revoked:
+		// Its family was already revoked; revoking again would let anyone
+		// holding an old token log the user out of their newer sessions.
+		return Rotated{}, false, ErrTokenRevoked
+	case !live:
+		// Expired is not evidence of theft (it can also be app/DB clock
+		// skew at the very end of the token's life): just reject it.
+		return Rotated{}, false, ErrNotFound
+	case !used:
 		if _, err := tx.ExecContext(ctx,
 			"UPDATE refresh_token SET used_at = UTC_TIMESTAMP(), replaced_by = ? WHERE jti = ?", newID, oldID); err != nil {
-			return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
+			return Rotated{}, false, fmt.Errorf("rotate refresh token: %w", err)
 		}
 		if err := insertRefreshToken(ctx, tx, newID, userID, newExpiresAt); err != nil {
-			return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
+			return Rotated{}, false, fmt.Errorf("rotate refresh token: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
-			return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
+			return Rotated{}, false, fmt.Errorf("rotate refresh token: %w", err)
 		}
-		return Rotated{ID: newID, ExpiresAt: newExpiresAt}, nil
-
-	case used && !revoked && live && inGrace && replacedBy.Valid:
+		return Rotated{ID: newID, ExpiresAt: newExpiresAt}, false, nil
+	case inGrace && replacedBy.Valid:
 		// Retry: hand back the child, provided it is still unused.
 		var child Rotated
 		var childUsable bool
@@ -110,28 +145,36 @@ func (r *RefreshTokenRepository) Rotate(ctx context.Context, oldID string, userI
 			FROM refresh_token WHERE jti = ? AND user_id = ? FOR UPDATE`,
 			replacedBy.String, userID).Scan(&child.ID, &child.ExpiresAt, &childUsable)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
+			return Rotated{}, false, fmt.Errorf("rotate refresh token: %w", err)
 		}
 		if err == nil && childUsable {
 			if err := tx.Commit(); err != nil {
-				return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
+				return Rotated{}, false, fmt.Errorf("rotate refresh token: %w", err)
 			}
-			return child, nil
+			return child, false, nil
 		}
 	}
-
-	if err := revokeAll(ctx, tx, userID); err != nil {
-		return Rotated{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Rotated{}, fmt.Errorf("revoke refresh tokens: %w", err)
-	}
-	return Rotated{}, ErrTokenReused
+	return Rotated{}, true, nil
 }
 
-// RevokeAll revokes every outstanding refresh token of the user.
+// RevokeAll ends every session of the user: it revokes all outstanding
+// refresh tokens and records the time on the user, so access tokens issued
+// before it are rejected too (see middlewares.AuthHandler).
 func (r *RefreshTokenRepository) RevokeAll(ctx context.Context, userID int64) error {
-	return revokeAll(ctx, r.db, userID)
+	// App clock, millisecond precision, matching the access tokens' iat.
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	return retryOnDeadlock(func() error {
+		if _, err := r.db.ExecContext(ctx,
+			"UPDATE user SET tokens_revoked_at = ? WHERE id = ?", now, userID); err != nil {
+			return fmt.Errorf("revoke sessions: %w", err)
+		}
+		_, err := r.db.ExecContext(ctx,
+			"UPDATE refresh_token SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ? AND revoked_at IS NULL", userID)
+		if err != nil {
+			return fmt.Errorf("revoke refresh tokens: %w", err)
+		}
+		return nil
+	})
 }
 
 // Prune deletes up to 1000 expired tokens, oldest first.
@@ -171,11 +214,18 @@ func insertRefreshToken(ctx context.Context, db execer, id string, userID int64,
 	return err
 }
 
-func revokeAll(ctx context.Context, db execer, userID int64) error {
-	_, err := db.ExecContext(ctx,
-		"UPDATE refresh_token SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ? AND revoked_at IS NULL", userID)
-	if err != nil {
-		return fmt.Errorf("revoke refresh tokens: %w", err)
+// mysqlErrDeadlock is MySQL error ER_LOCK_DEADLOCK: InnoDB rolled the
+// transaction back to break a deadlock, and it is safe to run it again.
+const mysqlErrDeadlock = 1213
+
+func retryOnDeadlock(fn func() error) error {
+	const attempts = 3
+	var err error
+	for i := 0; i < attempts; i++ {
+		var myErr *mysql.MySQLError
+		if err = fn(); !errors.As(err, &myErr) || myErr.Number != mysqlErrDeadlock {
+			return err
+		}
 	}
-	return nil
+	return err
 }

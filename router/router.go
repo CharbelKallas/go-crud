@@ -19,6 +19,9 @@ type Deps struct {
 	Albums  *handlers.AlbumHandler
 	Weather *handlers.WeatherHandler
 	DB      handlers.Pinger
+	// Sessions is checked on every authenticated request (deleted users,
+	// revoked sessions).
+	Sessions middlewares.SessionStore
 	// AuthRateLimitPerMinute limits the /api/auth routes per client IP;
 	// 0 disables the limit (tests).
 	AuthRateLimitPerMinute int
@@ -52,7 +55,7 @@ func New(d Deps) *gin.Engine {
 	public.POST("/signup", d.Auth.Signup)
 	public.POST("/refresh", d.Auth.Refresh)
 
-	requireAuth := middlewares.AuthHandler(d.Tokens)
+	requireAuth := middlewares.AuthHandler(d.Tokens, d.Sessions)
 
 	albums := api.Group("/albums", requireAuth)
 	// Both "/api/albums" and "/api/albums/" are served directly: a

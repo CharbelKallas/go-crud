@@ -11,4 +11,6 @@ var (
 	// ErrTokenReused is returned when a refresh token is presented again
 	// after being used or revoked.
 	ErrTokenReused = errors.New("refresh token reused")
+	// ErrTokenRevoked is returned for a refresh token that was revoked.
+	ErrTokenRevoked = errors.New("refresh token revoked")
 )

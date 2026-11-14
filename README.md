@@ -49,7 +49,7 @@ All configuration comes from environment variables. The app refuses to start if 
 
 ## API
 
-Protected routes need `Authorization: Bearer <Token>` using the **access** token from login. The refresh token is only accepted by `/api/auth/refresh`, and **each refresh token works once**: always store the new pair it returns. A retry within `REFRESH_REUSE_GRACE` (default 10 s, whole seconds) of the first use, for example after a lost response, returns the same new refresh token again rather than a different one. Presenting a refresh token later than that is treated as theft and revokes all of that user's refresh tokens, so the user must log in again. A failed refresh (5xx) does not consume the token and can be retried.
+Protected routes need `Authorization: Bearer <Token>` using the **access** token from login. The refresh token is only accepted by `/api/auth/refresh`, and **each refresh token works once**: always store the new pair it returns. A retry within `REFRESH_REUSE_GRACE` (default 10 s, whole seconds) of the first use, for example after a lost response, returns the same new refresh token again rather than a different one. Presenting a refresh token later than that is treated as theft and ends all of that user's sessions: every refresh token, and every access token issued before that moment, is rejected, so the user must log in again. Expired or already-revoked refresh tokens are simply rejected (401) without revoking anything. A failed refresh (5xx) does not consume the token and can be retried.
 
 `/api/auth/*` is rate-limited per client IP (`AUTH_RATE_LIMIT_PER_MINUTE`, 429 with `Retry-After` when exceeded). The limit is kept in memory per app instance. Behind a reverse proxy set `TRUSTED_PROXIES`; with Docker Desktop port forwarding, all local requests appear to come from the Docker gateway.
 
@@ -66,6 +66,8 @@ Protected routes need `Authorization: Bearer <Token>` using the **access** token
 | DELETE | `/api/albums/:id` | 200 id | 400, 404 |
 | GET | `/api/weather/:lat/:long` | 200 weather | 400 bad coordinates, 502 upstream error, 503 not configured |
 | GET | `/healthz` | 200 `{"status":"ok"}` | 503 database unreachable |
+
+Emails are matched case-insensitively but accent-sensitively (`jose@…` and `josé@…` are different accounts). Request bodies must be a single JSON object; a field of the wrong type is reported by name (e.g. `price must be a number`).
 
 Album responses look like `{"ID": 1, "Title": "Blue Train", "Artist": "John Coltrane", "Price": 56.99}`. Errors look like `{"message": "..."}`.
 

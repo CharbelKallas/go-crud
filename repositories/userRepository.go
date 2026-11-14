@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -42,6 +43,20 @@ func (r *UserRepository) UpdatePasswordHash(ctx context.Context, id int64, hash 
 		return fmt.Errorf("update password hash: %w", err)
 	}
 	return nil
+}
+
+// TokensRevokedAt returns when the user's sessions were last revoked (zero
+// if never), or ErrNotFound if the user no longer exists.
+func (r *UserRepository) TokensRevokedAt(ctx context.Context, email string) (time.Time, error) {
+	var revoked sql.NullTime
+	err := r.db.QueryRowContext(ctx, "SELECT tokens_revoked_at FROM user WHERE email = ?", email).Scan(&revoked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, ErrNotFound
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("tokens revoked at: %w", err)
+	}
+	return revoked.Time, nil
 }
 
 func (r *UserRepository) GetByEmail(ctx context.Context, email string) (models.User, error) {

@@ -76,13 +76,17 @@ func serve() error {
 	slog.Info("connected to database", "addr", cfg.DBAddr, "database", cfg.DBName)
 
 	if cfg.MigrateOnStart {
-		if err := database.Migrate(ctx, cfg); err != nil {
+		migrateCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		err := database.Migrate(migrateCtx, cfg)
+		cancel()
+		if err != nil {
 			return err
 		}
 	}
 
 	tokens := auth.NewTokenManager(cfg.JWTSecret, cfg.JWTIssuer, cfg.AccessTokenTTL, cfg.RefreshTokenTTL)
-	authHandler, err := handlers.NewAuthHandler(repositories.NewUserRepository(db), repositories.NewRefreshTokenRepository(db, cfg.RefreshReuseGrace), tokens, cfg.BcryptCost)
+	users := repositories.NewUserRepository(db)
+	authHandler, err := handlers.NewAuthHandler(users, repositories.NewRefreshTokenRepository(db, cfg.RefreshReuseGrace), tokens, cfg.BcryptCost)
 	if err != nil {
 		return err
 	}
@@ -99,11 +103,12 @@ func serve() error {
 	}
 
 	engine := router.New(router.Deps{
-		Tokens:  tokens,
-		Auth:    authHandler,
-		Albums:  handlers.NewAlbumHandler(repositories.NewAlbumRepository(db)),
-		Weather: handlers.NewWeatherHandler(weatherProvider),
-		DB:      db,
+		Tokens:   tokens,
+		Auth:     authHandler,
+		Albums:   handlers.NewAlbumHandler(repositories.NewAlbumRepository(db)),
+		Weather:  handlers.NewWeatherHandler(weatherProvider),
+		DB:       db,
+		Sessions: users,
 
 		AuthRateLimitPerMinute: cfg.AuthRateLimitPerMinute,
 		TrustedProxies:         cfg.TrustedProxies,

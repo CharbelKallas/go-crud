@@ -28,8 +28,25 @@ import (
 // --- fakes -----------------------------------------------------------------
 
 type fakeUsers struct {
-	mu    sync.Mutex
-	users map[string]models.User
+	mu      sync.Mutex
+	users   map[string]models.User
+	revoked map[string]time.Time
+}
+
+func (f *fakeUsers) TokensRevokedAt(_ context.Context, email string) (time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.users[email]; !ok {
+		return time.Time{}, repositories.ErrNotFound
+	}
+	return f.revoked[email], nil
+}
+
+// allowSessions is a SessionStore for tests that are not about sessions.
+type allowSessions struct{}
+
+func (allowSessions) TokensRevokedAt(context.Context, string) (time.Time, error) {
+	return time.Time{}, nil
 }
 
 func (f *fakeUsers) Create(_ context.Context, u models.User) error {
@@ -181,14 +198,16 @@ func (f *fakeRefresh) Rotate(_ context.Context, oldID string, userID int64, newI
 		return repositories.Rotated{}, repositories.ErrNotFound
 	}
 	switch {
-	case !row.used && !row.revoked:
+	case row.revoked:
+		return repositories.Rotated{}, repositories.ErrTokenRevoked
+	case !row.used:
 		if f.failSave != nil {
 			return repositories.Rotated{}, f.failSave // transaction rolled back: old token untouched
 		}
 		row.used, row.replacedBy = true, newID
 		f.tokens[newID] = &fakeRefreshRow{userID: userID, expiresAt: exp}
 		return repositories.Rotated{ID: newID, ExpiresAt: exp}, nil
-	case row.used && !row.revoked && f.grace:
+	case f.grace:
 		if child := f.tokens[row.replacedBy]; child != nil && !child.used && !child.revoked {
 			return repositories.Rotated{ID: row.replacedBy, ExpiresAt: child.expiresAt}, nil
 		}
@@ -249,11 +268,12 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	h.engine = router.New(router.Deps{
-		Tokens:  h.tokens,
-		Auth:    authHandler,
-		Albums:  handlers.NewAlbumHandler(h.albums),
-		Weather: handlers.NewWeatherHandler(h.weather),
-		DB:      fakePinger{},
+		Tokens:   h.tokens,
+		Auth:     authHandler,
+		Albums:   handlers.NewAlbumHandler(h.albums),
+		Weather:  handlers.NewWeatherHandler(h.weather),
+		DB:       fakePinger{},
+		Sessions: h.users,
 	})
 	return h
 }
@@ -454,6 +474,33 @@ func TestAuthMiddleware(t *testing.T) {
 	expect(t, rec, http.StatusOK)
 }
 
+func TestRevokedSessionsRejectAccessTokens(t *testing.T) {
+	h := newHarness(t)
+	old := h.login().Token
+	expect(t, h.do("GET", "/api/albums", old, nil), http.StatusOK)
+
+	// Theft detected: every token issued so far stops working...
+	time.Sleep(2 * time.Millisecond)
+	h.users.mu.Lock()
+	h.users.revoked = map[string]time.Time{"ann@example.com": time.Now().UTC().Truncate(time.Millisecond)}
+	h.users.mu.Unlock()
+	expect(t, h.do("GET", "/api/albums", old, nil), http.StatusUnauthorized)
+
+	// ...but logging in again works.
+	time.Sleep(2 * time.Millisecond)
+	rec := h.do("POST", "/api/auth/login", "", map[string]string{"email": "ann@example.com", "password": "correct horse"})
+	expect(t, rec, http.StatusOK)
+	var fresh handlers.LoginResponse
+	decode(t, rec, &fresh)
+	expect(t, h.do("GET", "/api/albums", fresh.Token, nil), http.StatusOK)
+
+	// A deleted user's tokens stop working.
+	h.users.mu.Lock()
+	delete(h.users.users, "ann@example.com")
+	h.users.mu.Unlock()
+	expect(t, h.do("GET", "/api/albums", fresh.Token, nil), http.StatusUnauthorized)
+}
+
 func TestAlbumCRUD(t *testing.T) {
 	h := newHarness(t)
 	tok := h.login().Token
@@ -544,6 +591,28 @@ func TestValidationMessages(t *testing.T) {
 	}
 }
 
+func TestJSONBodyErrors(t *testing.T) {
+	h := newHarness(t)
+	tok := h.login().Token
+	for body, want := range map[string]string{
+		`{"title":"t","artist":"a","price":"12.5"}`:         "price must be a number",
+		`{"title":5,"artist":"a","price":1}`:                "title must be a string",
+		`{"title":"t","artist":"a","price":1}{"price":999}`: "invalid JSON body: unexpected data after the JSON object",
+		`{"title":"t","artist":"a","price":1} trailing`:     "invalid JSON body: unexpected data after the JSON object",
+		`{"title":"t",`: "invalid JSON body",
+	} {
+		rec := h.do("POST", "/api/albums", tok, body)
+		expect(t, rec, http.StatusBadRequest)
+		var e struct{ Message string }
+		decode(t, rec, &e)
+		if e.Message != want {
+			t.Errorf("%s: message = %q, want %q", body, e.Message, want)
+		}
+	}
+	// Trailing whitespace is fine.
+	expect(t, h.do("POST", "/api/albums", tok, "{\"title\":\"t\",\"artist\":\"a\",\"price\":1}\n  "), http.StatusCreated)
+}
+
 func TestInternalErrorsAreHidden(t *testing.T) {
 	h := newHarness(t)
 	tok := h.login().Token
@@ -580,7 +649,7 @@ func TestWeatherNotConfigured(t *testing.T) {
 	tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", time.Minute, time.Hour)
 	authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, newFakeRefresh(), tokens, bcrypt.MinCost)
 	engine := router.New(router.Deps{
-		Tokens: tokens, Auth: authHandler, DB: fakePinger{},
+		Tokens: tokens, Auth: authHandler, DB: fakePinger{}, Sessions: allowSessions{},
 		Albums:  handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
 		Weather: handlers.NewWeatherHandler(nil),
 	})
@@ -597,7 +666,7 @@ func TestAuthRoutesAreRateLimited(t *testing.T) {
 	tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", time.Minute, time.Hour)
 	authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, newFakeRefresh(), tokens, bcrypt.MinCost)
 	engine := router.New(router.Deps{
-		Tokens: tokens, Auth: authHandler, DB: fakePinger{},
+		Tokens: tokens, Auth: authHandler, DB: fakePinger{}, Sessions: allowSessions{},
 		Albums:                 handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
 		Weather:                handlers.NewWeatherHandler(nil),
 		AuthRateLimitPerMinute: 2,
@@ -660,7 +729,7 @@ func TestRateLimitUsesTrustedProxyHeader(t *testing.T) {
 		tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", time.Minute, time.Hour)
 		authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, newFakeRefresh(), tokens, bcrypt.MinCost)
 		return router.New(router.Deps{
-			Tokens: tokens, Auth: authHandler, DB: fakePinger{},
+			Tokens: tokens, Auth: authHandler, DB: fakePinger{}, Sessions: allowSessions{},
 			Albums:                 handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
 			Weather:                handlers.NewWeatherHandler(nil),
 			AuthRateLimitPerMinute: 1,

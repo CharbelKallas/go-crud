@@ -42,7 +42,7 @@ func TestIssueReturnsUniqueIDs(t *testing.T) {
 		t.Fatal("tokens issued in the same second are identical")
 	}
 	claims, err := m.Validate(a.Token, RefreshToken)
-	if err != nil || claims.ID != a.ID || !claims.ExpiresAt.Time.Equal(a.ExpiresAt.Truncate(time.Second)) {
+	if err != nil || claims.ID != a.ID || !claims.ExpiresAt.Time.Equal(a.ExpiresAt.Truncate(time.Millisecond)) {
 		t.Fatalf("claims = %+v, issued = %+v, err = %v", claims, a, err)
 	}
 }

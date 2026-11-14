@@ -124,6 +124,27 @@ func TestAlbumRepository(t *testing.T) {
 	}
 }
 
+func TestEmailCollation(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	repo := repositories.NewUserRepository(testDB)
+	if err := repo.Create(ctx, models.User{Name: "A", Email: "jose@example.com", Password: "h"}); err != nil {
+		t.Fatal(err)
+	}
+	// Accents make a different address...
+	if err := repo.Create(ctx, models.User{Name: "B", Email: "jos\u00e9@example.com", Password: "h"}); err != nil {
+		t.Fatalf("accented email rejected: %v", err)
+	}
+	// ...case does not.
+	if err := repo.Create(ctx, models.User{Name: "C", Email: "JOSE@example.com", Password: "h"}); !errors.Is(err, repositories.ErrDuplicateEmail) {
+		t.Fatalf("case variant: %v", err)
+	}
+	u, err := repo.GetByEmail(ctx, "jose@example.com")
+	if err != nil || u.Name != "A" {
+		t.Fatalf("lookup = %+v, %v", u, err)
+	}
+}
+
 func TestUserRepository(t *testing.T) {
 	reset(t)
 	ctx := context.Background()
@@ -161,11 +182,12 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(router.New(router.Deps{
-		Tokens:  tokens,
-		Auth:    authHandler,
-		Albums:  handlers.NewAlbumHandler(repositories.NewAlbumRepository(testDB)),
-		Weather: handlers.NewWeatherHandler(nil),
-		DB:      testDB,
+		Tokens:   tokens,
+		Auth:     authHandler,
+		Albums:   handlers.NewAlbumHandler(repositories.NewAlbumRepository(testDB)),
+		Weather:  handlers.NewWeatherHandler(nil),
+		DB:       testDB,
+		Sessions: repositories.NewUserRepository(testDB),
 	}))
 	defer srv.Close()
 
@@ -237,13 +259,20 @@ func TestEndToEnd(t *testing.T) {
 	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": login.RefreshToken}, 200, &refreshed)
 	call("GET", "/api/albums", refreshed.Token, nil, 200, nil)
 
-	// Reusing a refresh token revokes the whole family.
+	// Reusing a refresh token ends every session: all refresh tokens and
+	// the access tokens issued so far.
 	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": login.RefreshToken}, 401, nil)
 	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": refreshed.RefreshToken}, 401, nil)
+	call("GET", "/api/albums", login.Token, nil, 401, nil)
+	call("GET", "/api/albums", refreshed.Token, nil, 401, nil)
 
-	// A fresh login works again.
+	// A fresh login works again, and an old revoked token presented again
+	// does not log the user out a second time.
+	time.Sleep(5 * time.Millisecond)
 	var again handlers.LoginResponse
 	call("POST", "/api/auth/login", "", map[string]string{"email": "ann@example.com", "password": "correct horse"}, 200, &again)
+	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": refreshed.RefreshToken}, 401, nil)
+	call("GET", "/api/albums", again.Token, nil, 200, nil)
 	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": again.RefreshToken}, 200, nil)
 }
 
@@ -288,9 +317,13 @@ func TestRefreshTokenRepository(t *testing.T) {
 			t.Fatal("token stored for a rejected rotation")
 		}
 		for _, id := range []string{"s2", "s1-next"} {
-			if _, err := repo.Rotate(ctx, id, u.ID, id+"-x", future); !errors.Is(err, repositories.ErrTokenReused) {
+			if _, err := repo.Rotate(ctx, id, u.ID, id+"-x", future); !errors.Is(err, repositories.ErrTokenRevoked) {
 				t.Fatalf("%s not revoked: %v", id, err)
 			}
+		}
+		var revokedAt sql.NullTime
+		if err := testDB.QueryRow("SELECT tokens_revoked_at FROM user WHERE id = ?", u.ID).Scan(&revokedAt); err != nil || !revokedAt.Valid {
+			t.Fatalf("tokens_revoked_at not set: %v %v", revokedAt, err)
 		}
 		if _, err := repo.Rotate(ctx, "nope", u.ID, "y", future); !errors.Is(err, repositories.ErrNotFound) {
 			t.Fatalf("unknown: %v", err)
@@ -352,6 +385,22 @@ func TestRefreshTokenRepository(t *testing.T) {
 		}
 		if _, err := repo.Rotate(ctx, "e1", u.ID, "e1-b", future); !errors.Is(err, repositories.ErrTokenReused) {
 			t.Fatalf("retry after grace: %v", err)
+		}
+	})
+
+	t.Run("expired token is rejected without revoking", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 0)
+		if err := repo.Save(ctx, "x-old", u.ID, time.Now().Add(-time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, "x-live", u.ID, future); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.Rotate(ctx, "x-old", u.ID, "x-old-next", future); !errors.Is(err, repositories.ErrNotFound) {
+			t.Fatalf("expired: %v", err)
+		}
+		if _, err := repo.Rotate(ctx, "x-live", u.ID, "x-live-next", future); err != nil {
+			t.Fatalf("sibling revoked by an expired token: %v", err)
 		}
 	})
 
