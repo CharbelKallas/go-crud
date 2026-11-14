@@ -28,6 +28,8 @@ func mysqlConfig(cfg config.Config) *mysql.Config {
 	// Report matched rather than changed rows, so an UPDATE that leaves a
 	// row unchanged is not mistaken for a missing row.
 	c.ClientFoundRows = true
+	// Scan DATETIME columns into time.Time (UTC, the driver's default Loc).
+	c.ParseTime = true
 	c.Timeout = 5 * time.Second
 	c.ReadTimeout = 30 * time.Second
 	c.WriteTimeout = 30 * time.Second
@@ -73,10 +75,11 @@ func pingWithRetry(ctx context.Context, db *sql.DB) error {
 	}
 }
 
-// Migrate applies all pending migrations embedded in the binary. It uses a
-// dedicated connection with multi-statement support, which the main pool
-// deliberately does not enable.
-func Migrate(cfg config.Config) error {
+// Migrate applies all pending migrations embedded in the binary, first
+// waiting (until ctx is done) for the database to accept connections. It
+// uses a dedicated connection with multi-statement support, which the main
+// pool deliberately does not enable.
+func Migrate(ctx context.Context, cfg config.Config) error {
 	mc := mysqlConfig(cfg)
 	mc.MultiStatements = true
 	connector, err := mysql.NewConnector(mc)
@@ -84,6 +87,11 @@ func Migrate(cfg config.Config) error {
 		return fmt.Errorf("mysql config: %w", err)
 	}
 	db := sql.OpenDB(connector)
+	db.SetMaxOpenConns(1)
+	if err := pingWithRetry(ctx, db); err != nil {
+		db.Close()
+		return err
+	}
 
 	driver, err := migratemysql.WithInstance(db, &migratemysql.Config{})
 	if err != nil {

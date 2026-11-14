@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -151,7 +152,7 @@ func (f *fakeWeather) Current(_ context.Context, lat, lon float64) (models.Weath
 
 type fakeRefresh struct {
 	mu       sync.Mutex
-	grace    bool // allow one immediate re-use, like the DB grace window
+	grace    bool // retries of a just-used token return its child, like the DB grace window
 	tokens   map[string]*fakeRefreshRow
 	failSave error
 }
@@ -159,48 +160,63 @@ type fakeRefresh struct {
 type fakeRefreshRow struct {
 	userID        int64
 	used, revoked bool
+	replacedBy    string
+	expiresAt     time.Time
 }
 
 func newFakeRefresh() *fakeRefresh { return &fakeRefresh{tokens: map[string]*fakeRefreshRow{}} }
 
-func (f *fakeRefresh) Save(_ context.Context, id string, userID int64, _ time.Time) error {
+func (f *fakeRefresh) Save(_ context.Context, id string, userID int64, exp time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.tokens[id] = &fakeRefreshRow{userID: userID}
+	f.tokens[id] = &fakeRefreshRow{userID: userID, expiresAt: exp}
 	return nil
 }
 
-func (f *fakeRefresh) Rotate(_ context.Context, oldID string, userID int64, newID string, _ time.Time) error {
+func (f *fakeRefresh) Rotate(_ context.Context, oldID string, userID int64, newID string, exp time.Time) (repositories.Rotated, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	row, ok := f.tokens[oldID]
 	if !ok || row.userID != userID {
-		return repositories.ErrNotFound
+		return repositories.Rotated{}, repositories.ErrNotFound
 	}
-	if row.revoked || (row.used && !f.grace) {
-		for _, r := range f.tokens {
-			if r.userID == userID {
-				r.revoked = true
-			}
+	switch {
+	case !row.used && !row.revoked:
+		if f.failSave != nil {
+			return repositories.Rotated{}, f.failSave // transaction rolled back: old token untouched
 		}
-		return repositories.ErrTokenReused
+		row.used, row.replacedBy = true, newID
+		f.tokens[newID] = &fakeRefreshRow{userID: userID, expiresAt: exp}
+		return repositories.Rotated{ID: newID, ExpiresAt: exp}, nil
+	case row.used && !row.revoked && f.grace:
+		if child := f.tokens[row.replacedBy]; child != nil && !child.used && !child.revoked {
+			return repositories.Rotated{ID: row.replacedBy, ExpiresAt: child.expiresAt}, nil
+		}
 	}
-	if f.failSave != nil {
-		return f.failSave // transaction rolled back: old token untouched
+	for _, r := range f.tokens {
+		if r.userID == userID {
+			r.revoked = true
+		}
 	}
-	row.used = true
-	f.tokens[newID] = &fakeRefreshRow{userID: userID}
-	return nil
+	return repositories.Rotated{}, repositories.ErrTokenReused
 }
 
 type fakePinger struct {
-	err   error
-	calls *int
+	err     error
+	calls   *atomic.Int32
+	release chan struct{} // when set, pings block until it is closed
 }
 
-func (f fakePinger) PingContext(context.Context) error {
+func (f fakePinger) PingContext(ctx context.Context) error {
 	if f.calls != nil {
-		*f.calls++
+		f.calls.Add(1)
+	}
+	if f.release != nil {
+		select {
+		case <-f.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return f.err
 }
@@ -606,13 +622,36 @@ func TestFailedRefreshCanBeRetried(t *testing.T) {
 	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": tokens.RefreshToken}), http.StatusOK)
 }
 
-func TestRefreshRetryWithinGrace(t *testing.T) {
+func TestRefreshRetryWithinGraceReturnsSameToken(t *testing.T) {
 	h := newHarness(t)
 	h.refresh.grace = true
 	tokens := h.login()
-	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": tokens.RefreshToken}), http.StatusOK)
-	// The response was "lost": the client retries with the same token.
-	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": tokens.RefreshToken}), http.StatusOK)
+	refresh := func() (int, handlers.LoginResponse) {
+		rec := h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": tokens.RefreshToken})
+		var r handlers.LoginResponse
+		if rec.Code == http.StatusOK {
+			decode(t, rec, &r)
+		}
+		return rec.Code, r
+	}
+	_, first := refresh()
+	// The response was "lost" (or the token was replayed): the retry gets
+	// the same child token (same jti), not an independent one.
+	code, retry := refresh()
+	if code != http.StatusOK {
+		t.Fatalf("retry = %d", code)
+	}
+	a, _ := h.tokens.Validate(first.RefreshToken, auth.RefreshToken)
+	b, _ := h.tokens.Validate(retry.RefreshToken, auth.RefreshToken)
+	if a == nil || b == nil || a.ID != b.ID {
+		t.Fatalf("retry issued a different refresh token: %v vs %v", a, b)
+	}
+	// Once the child is used, the parent can no longer be replayed, and
+	// the attempt revokes everything.
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": first.RefreshToken}), http.StatusOK)
+	if code, _ := refresh(); code != http.StatusUnauthorized {
+		t.Fatalf("replay after child used = %d", code)
+	}
 }
 
 func TestRateLimitUsesTrustedProxyHeader(t *testing.T) {
@@ -651,7 +690,7 @@ func TestRateLimitUsesTrustedProxyHeader(t *testing.T) {
 }
 
 func TestHealthCachesDatabaseCheck(t *testing.T) {
-	calls := 0
+	var calls atomic.Int32
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.GET("/healthz", handlers.Health(fakePinger{calls: &calls}))
@@ -660,9 +699,61 @@ func TestHealthCachesDatabaseCheck(t *testing.T) {
 		r.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 		expect(t, rec, http.StatusOK)
 	}
-	if calls != 1 {
-		t.Fatalf("database pinged %d times, want 1", calls)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("database pinged %d times, want 1", n)
 	}
+}
+
+func TestHealthConcurrentRequestsShareOnePing(t *testing.T) {
+	var calls atomic.Int32
+	release := make(chan struct{})
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/healthz", handlers.Health(fakePinger{calls: &calls, release: release}))
+
+	var wg sync.WaitGroup
+	codes := make([]int, 10)
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+			codes[i] = rec.Code
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	for _, c := range codes {
+		if c != http.StatusOK {
+			t.Fatalf("codes = %v", codes)
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("database pinged %d times, want 1", n)
+	}
+}
+
+func TestHealthIgnoresCancelledClient(t *testing.T) {
+	release := make(chan struct{})
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/healthz", handlers.Health(fakePinger{release: release}))
+
+	// The first client gives up while the ping is still running...
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil).WithContext(ctx))
+	expect(t, rec, http.StatusServiceUnavailable)
+
+	// ...but the ping itself is not cancelled, so the next client sees the
+	// real (healthy) result rather than a cached failure.
+	close(release)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	expect(t, rec, http.StatusOK)
 }
 
 func TestHealth(t *testing.T) {

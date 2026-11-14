@@ -13,7 +13,7 @@ cp .env.example .env    # then fill in the empty secrets in .env
 docker compose up --build
 ```
 
-The API listens on http://localhost:8080. MySQL is published on `127.0.0.1:3307` for local tools. A one-shot `migrate` service applies database migrations before the API starts; if it fails, `docker compose up` stops and `docker compose logs migrate` shows why. Outside Compose, the API applies migrations at startup (`MIGRATE_ON_START=true`), or run `go-crud migrate`.
+The API listens on http://localhost:8080. MySQL is published on `127.0.0.1:3307` for local tools. A one-shot `migrate` service applies database migrations before the API starts; if it fails, `docker compose up` stops and `docker compose logs migrate` shows why. Outside Compose, the API applies migrations at startup (`MIGRATE_ON_START=true`), or run `go-crud migrate`, which needs only the `DB_*`/`DATABASE_ADDR` settings.
 
 ## Run locally
 
@@ -40,7 +40,7 @@ All configuration comes from environment variables. The app refuses to start if 
 | `BCRYPT_COST` | | `12` | 10–31 |
 | `AUTH_RATE_LIMIT_PER_MINUTE` | | `10` | Requests per client IP per minute to `/api/auth/*`; over the limit answers 429 |
 | `TRUSTED_PROXIES` | | | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-For` is trusted. **Set it behind a reverse proxy or load balancer**, or all clients share the proxy's rate limit |
-| `REFRESH_REUSE_GRACE` | | `10s` | How long a just-used refresh token may be retried (lost response); `0s` = strictly single-use |
+| `REFRESH_REUSE_GRACE` | | `10s` | How long a just-used refresh token may be retried (lost response); the retry gets the same new token. Whole seconds, at most `1m`; `0s` = strictly single-use |
 | `HTTP_ADDR` | | `:8080` | |
 | `MIGRATE_ON_START` | | `true` | |
 | `WEATHER_API_KEY` | | | Without it `/api/weather` answers 503 |
@@ -49,7 +49,7 @@ All configuration comes from environment variables. The app refuses to start if 
 
 ## API
 
-Protected routes need `Authorization: Bearer <Token>` using the **access** token from login. The refresh token is only accepted by `/api/auth/refresh`, and **each refresh token works once**: always store the new pair it returns. Presenting a refresh token again after `REFRESH_REUSE_GRACE` (default 10 s, for retries after a lost response) is treated as theft and revokes all of that user's refresh tokens, so the user must log in again. A failed refresh (5xx) does not consume the token and can be retried.
+Protected routes need `Authorization: Bearer <Token>` using the **access** token from login. The refresh token is only accepted by `/api/auth/refresh`, and **each refresh token works once**: always store the new pair it returns. A retry within `REFRESH_REUSE_GRACE` (default 10 s, whole seconds) of the first use, for example after a lost response, returns the same new refresh token again rather than a different one. Presenting a refresh token later than that is treated as theft and revokes all of that user's refresh tokens, so the user must log in again. A failed refresh (5xx) does not consume the token and can be retried.
 
 `/api/auth/*` is rate-limited per client IP (`AUTH_RATE_LIMIT_PER_MINUTE`, 429 with `Retry-After` when exceeded). The limit is kept in memory per app instance. Behind a reverse proxy set `TRUSTED_PROXIES`; with Docker Desktop port forwarding, all local requests appear to come from the Docker gateway.
 

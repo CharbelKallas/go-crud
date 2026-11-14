@@ -62,7 +62,7 @@ func TestMain(m *testing.M) {
 	}
 	// Applying twice must be a no-op.
 	for i := 0; i < 2; i++ {
-		if err := database.Migrate(cfg); err != nil {
+		if err := database.Migrate(ctx, cfg); err != nil {
 			panic(err)
 		}
 	}
@@ -272,27 +272,27 @@ func TestRefreshTokenRepository(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := repo.Rotate(ctx, "s1", u.ID+1, "x", future); !errors.Is(err, repositories.ErrNotFound) {
+		if _, err := repo.Rotate(ctx, "s1", u.ID+1, "x", future); !errors.Is(err, repositories.ErrNotFound) {
 			t.Fatalf("other user's token: %v", err)
 		}
-		if err := repo.Rotate(ctx, "s1", u.ID, "s1-next", future); err != nil {
+		if _, err := repo.Rotate(ctx, "s1", u.ID, "s1-next", future); err != nil {
 			t.Fatalf("first use: %v", err)
 		}
 		if count("jti = 's1-next'") != 1 {
 			t.Fatal("new token not stored")
 		}
-		if err := repo.Rotate(ctx, "s1", u.ID, "s1-again", future); !errors.Is(err, repositories.ErrTokenReused) {
+		if _, err := repo.Rotate(ctx, "s1", u.ID, "s1-again", future); !errors.Is(err, repositories.ErrTokenReused) {
 			t.Fatalf("second use: %v", err)
 		}
 		if count("jti = 's1-again'") != 0 {
 			t.Fatal("token stored for a rejected rotation")
 		}
 		for _, id := range []string{"s2", "s1-next"} {
-			if err := repo.Rotate(ctx, id, u.ID, id+"-x", future); !errors.Is(err, repositories.ErrTokenReused) {
+			if _, err := repo.Rotate(ctx, id, u.ID, id+"-x", future); !errors.Is(err, repositories.ErrTokenReused) {
 				t.Fatalf("%s not revoked: %v", id, err)
 			}
 		}
-		if err := repo.Rotate(ctx, "nope", u.ID, "y", future); !errors.Is(err, repositories.ErrNotFound) {
+		if _, err := repo.Rotate(ctx, "nope", u.ID, "y", future); !errors.Is(err, repositories.ErrNotFound) {
 			t.Fatalf("unknown: %v", err)
 		}
 	})
@@ -306,30 +306,51 @@ func TestRefreshTokenRepository(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Duplicate new ID makes the INSERT fail inside the transaction.
-		if err := repo.Rotate(ctx, "r1", u.ID, "taken", future); err == nil {
+		if _, err := repo.Rotate(ctx, "r1", u.ID, "taken", future); err == nil {
 			t.Fatal("expected an error")
 		}
-		if err := repo.Rotate(ctx, "r1", u.ID, "r1-next", future); err != nil {
+		if _, err := repo.Rotate(ctx, "r1", u.ID, "r1-next", future); err != nil {
 			t.Fatalf("token burned by a failed rotation: %v", err)
 		}
 	})
 
-	t.Run("grace window allows a retry", func(t *testing.T) {
+	t.Run("grace retry returns the same child", func(t *testing.T) {
 		repo := repositories.NewRefreshTokenRepository(testDB, 10*time.Second)
 		if err := repo.Save(ctx, "g1", u.ID, future); err != nil {
 			t.Fatal(err)
 		}
-		if err := repo.Rotate(ctx, "g1", u.ID, "g1-a", future); err != nil {
+		first, err := repo.Rotate(ctx, "g1", u.ID, "g1-a", future)
+		if err != nil || first.ID != "g1-a" {
+			t.Fatalf("first = %+v, %v", first, err)
+		}
+		retry, err := repo.Rotate(ctx, "g1", u.ID, "g1-b", future)
+		if err != nil || retry.ID != "g1-a" || !retry.ExpiresAt.Equal(first.ExpiresAt.UTC().Round(time.Second)) {
+			t.Fatalf("retry = %+v (first %+v), %v", retry, first, err)
+		}
+		if count("jti = 'g1-b'") != 0 {
+			t.Fatal("retry stored a second child")
+		}
+		// After the child is used, replaying the parent is theft.
+		if _, err := repo.Rotate(ctx, "g1-a", u.ID, "g1-a1", future); err != nil {
 			t.Fatal(err)
 		}
-		if err := repo.Rotate(ctx, "g1", u.ID, "g1-b", future); err != nil {
-			t.Fatalf("retry within grace: %v", err)
+		if _, err := repo.Rotate(ctx, "g1", u.ID, "g1-c", future); !errors.Is(err, repositories.ErrTokenReused) {
+			t.Fatalf("replay after child used: %v", err)
 		}
-		// Outside the window it is theft again.
-		if _, err := testDB.Exec("UPDATE refresh_token SET used_at = UTC_TIMESTAMP() - INTERVAL 1 MINUTE WHERE jti = 'g1'"); err != nil {
+	})
+
+	t.Run("grace window expires", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 10*time.Second)
+		if err := repo.Save(ctx, "e1", u.ID, future); err != nil {
 			t.Fatal(err)
 		}
-		if err := repo.Rotate(ctx, "g1", u.ID, "g1-c", future); !errors.Is(err, repositories.ErrTokenReused) {
+		if _, err := repo.Rotate(ctx, "e1", u.ID, "e1-a", future); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testDB.Exec("UPDATE refresh_token SET used_at = UTC_TIMESTAMP() - INTERVAL 1 MINUTE WHERE jti = 'e1'"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.Rotate(ctx, "e1", u.ID, "e1-b", future); !errors.Is(err, repositories.ErrTokenReused) {
 			t.Fatalf("retry after grace: %v", err)
 		}
 	})

@@ -47,6 +47,19 @@ func TestIssueReturnsUniqueIDs(t *testing.T) {
 	}
 }
 
+func TestIssueWithIDReissuesSameToken(t *testing.T) {
+	m := newManager()
+	orig, _ := m.Issue("a@example.com", RefreshToken)
+	again, err := m.IssueWithID("a@example.com", RefreshToken, orig.ID, orig.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := m.Validate(again.Token, RefreshToken)
+	if err != nil || claims.ID != orig.ID || claims.ExpiresAt.Unix() != orig.ExpiresAt.Unix() {
+		t.Fatalf("claims = %+v, err = %v", claims, err)
+	}
+}
+
 func TestTokenTypeIsEnforced(t *testing.T) {
 	m := newManager()
 	refresh, _ := m.Generate("a@example.com", RefreshToken)

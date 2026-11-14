@@ -30,7 +30,7 @@ type UserStore interface {
 // repositories.RefreshTokenRepository).
 type RefreshTokenStore interface {
 	Save(ctx context.Context, id string, userID int64, expiresAt time.Time) error
-	Rotate(ctx context.Context, oldID string, userID int64, newID string, newExpiresAt time.Time) error
+	Rotate(ctx context.Context, oldID string, userID int64, newID string, newExpiresAt time.Time) (repositories.Rotated, error)
 }
 
 type AuthHandler struct {
@@ -144,7 +144,8 @@ func (h *AuthHandler) Login(c *gin.Context) {
 }
 
 // Refresh exchanges a valid refresh token for a new access/refresh pair.
-// Each refresh token works once (plus a short grace window for retries);
+// Each refresh token works once; within a short grace window a retry gets
+// the same new refresh token again;
 // presenting a used one again revokes all of the user's refresh tokens, as
 // the token was probably stolen. The old token is only consumed if the new
 // one is stored, so a failed refresh can be retried.
@@ -175,7 +176,8 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		respondInternal(c, err)
 		return
 	}
-	switch err := h.refresh.Rotate(c.Request.Context(), claims.ID, user.ID, refresh.ID, refresh.ExpiresAt); {
+	rotated, err := h.refresh.Rotate(c.Request.Context(), claims.ID, user.ID, refresh.ID, refresh.ExpiresAt)
+	switch {
 	case errors.Is(err, repositories.ErrTokenReused):
 		slog.WarnContext(c.Request.Context(), "refresh token reused; revoked all refresh tokens of the user", "user_id", user.ID)
 		respondError(c, http.StatusUnauthorized, "invalid refresh token")
@@ -186,6 +188,13 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	case err != nil:
 		respondInternal(c, err)
 		return
+	}
+	if rotated.ID != refresh.ID {
+		// A retry: re-sign the refresh token that was already issued.
+		if refresh, err = h.tokens.IssueWithID(user.Email, auth.RefreshToken, rotated.ID, rotated.ExpiresAt); err != nil {
+			respondInternal(c, err)
+			return
+		}
 	}
 	c.JSON(http.StatusOK, LoginResponse{Token: access, RefreshToken: refresh.Token})
 }

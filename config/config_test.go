@@ -43,6 +43,7 @@ func TestLoadRejectsMissingOrWeakSecrets(t *testing.T) {
 		"low bcrypt cost":  func(t *testing.T) { t.Setenv("BCRYPT_COST", "4") },
 		"zero rate limit":  func(t *testing.T) { t.Setenv("AUTH_RATE_LIMIT_PER_MINUTE", "0") },
 		"long grace":       func(t *testing.T) { t.Setenv("REFRESH_REUSE_GRACE", "5m") },
+		"sub-second grace": func(t *testing.T) { t.Setenv("REFRESH_REUSE_GRACE", "400ms") },
 		"bad proxy":        func(t *testing.T) { t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, nginx") },
 		"half signing cfg": func(t *testing.T) { t.Setenv("WEATHER_SIGNING_SECRET", "s") },
 	}
@@ -67,5 +68,22 @@ func TestLoadTrustedProxies(t *testing.T) {
 	want := []string{"10.0.0.0/8", "192.0.2.7", "2001:db8::/32"}
 	if strings.Join(cfg.TrustedProxies, " ") != strings.Join(want, " ") {
 		t.Fatalf("TrustedProxies = %v", cfg.TrustedProxies)
+	}
+}
+
+func TestLoadDatabaseNeedsOnlyDBSettings(t *testing.T) {
+	setValidEnv(t)
+	t.Setenv("JWT_SECRET", "")
+	t.Setenv("BCRYPT_COST", "nonsense")
+	cfg, err := LoadDatabase()
+	if err != nil {
+		t.Fatalf("LoadDatabase: %v", err)
+	}
+	if cfg.DBUser != "app" || cfg.DBName != "recordings" {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+	t.Setenv("DB_PASSWORD", "")
+	if _, err := LoadDatabase(); err == nil {
+		t.Fatal("missing DB_PASSWORD accepted")
 	}
 }

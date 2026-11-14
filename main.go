@@ -44,21 +44,17 @@ func main() {
 // migrate applies pending migrations and exits. docker-compose runs it as a
 // one-shot service before the API starts, so a failed migration stops the
 // stack with a clear error instead of crash-looping the API.
+// It needs only the database settings.
 func migrate() error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadDatabase()
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	connectCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	db, err := database.Open(connectCtx, cfg)
-	cancel()
-	if err != nil {
-		return err
-	}
-	db.Close()
-	return database.Migrate(cfg)
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	return database.Migrate(ctx, cfg)
 }
 
 func serve() error {
@@ -80,7 +76,7 @@ func serve() error {
 	slog.Info("connected to database", "addr", cfg.DBAddr, "database", cfg.DBName)
 
 	if cfg.MigrateOnStart {
-		if err := database.Migrate(cfg); err != nil {
+		if err := database.Migrate(ctx, cfg); err != nil {
 			return err
 		}
 	}

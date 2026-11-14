@@ -68,24 +68,25 @@ func (m *TokenManager) Generate(email string, typ TokenType) (string, error) {
 // Issue signs a new token of the given type and returns it with its unique
 // ID and expiry, so refresh tokens can be recorded server-side.
 func (m *TokenManager) Issue(email string, typ TokenType) (Issued, error) {
-	var ttl time.Duration
-	switch typ {
-	case AccessToken:
-		ttl = m.accessTTL
-	case RefreshToken:
-		ttl = m.refreshTTL
-	default:
-		return Issued{}, fmt.Errorf("unknown token type %q", typ)
-	}
-
 	idBytes := make([]byte, 16)
 	if _, err := rand.Read(idBytes); err != nil {
 		return Issued{}, fmt.Errorf("token id: %w", err)
 	}
-	id := hex.EncodeToString(idBytes)
+	ttl, err := m.ttl(typ)
+	if err != nil {
+		return Issued{}, err
+	}
+	return m.IssueWithID(email, typ, hex.EncodeToString(idBytes), m.now().Add(ttl))
+}
 
+// IssueWithID signs a token with a given ID and expiry. It re-issues an
+// already recorded refresh token (same ID, same expiry) when a client
+// retries a refresh.
+func (m *TokenManager) IssueWithID(email string, typ TokenType, id string, expiresAt time.Time) (Issued, error) {
+	if _, err := m.ttl(typ); err != nil {
+		return Issued{}, err
+	}
 	now := m.now()
-	expiresAt := now.Add(ttl)
 	claims := Claims{
 		Email: email,
 		Type:  typ,
@@ -103,6 +104,19 @@ func (m *TokenManager) Issue(email string, typ TokenType) (Issued, error) {
 		return Issued{}, err
 	}
 	return Issued{Token: signed, ID: id, ExpiresAt: expiresAt}, nil
+}
+
+func (m *TokenManager) ttl(typ TokenType) (time.Duration, error) {
+	var ttl time.Duration
+	switch typ {
+	case AccessToken:
+		ttl = m.accessTTL
+	case RefreshToken:
+		ttl = m.refreshTTL
+	default:
+		return 0, fmt.Errorf("unknown token type %q", typ)
+	}
+	return ttl, nil
 }
 
 // Validate parses the token and checks its signature, algorithm, issuer,

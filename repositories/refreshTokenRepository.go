@@ -3,6 +3,7 @@ package repositories
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -17,9 +18,9 @@ const pruneInterval = time.Minute
 type RefreshTokenRepository struct {
 	db *sql.DB
 	// reuseGrace is how long after its first use a refresh token may be
-	// presented again (rounded to whole seconds). It lets a client retry
-	// a refresh whose response it never received without triggering
-	// theft detection. Zero makes tokens strictly single-use.
+	// presented again (whole seconds; config.Load enforces this). It lets
+	// a client retry a refresh whose response it never received without
+	// triggering theft detection. Zero makes tokens strictly single-use.
 	reuseGrace time.Duration
 
 	pruneMu   sync.Mutex
@@ -40,62 +41,92 @@ func (r *RefreshTokenRepository) Save(ctx context.Context, id string, userID int
 	return nil
 }
 
-// Rotate exchanges the refresh token oldID for newID in one transaction:
-// either the old token is marked used and the new one stored, or nothing
-// changes, so a failure never burns the client's token.
+// Rotated is the refresh token the client should receive after Rotate.
+type Rotated struct {
+	ID        string
+	ExpiresAt time.Time
+}
+
+// Rotate exchanges the refresh token oldID for a new one in a single
+// transaction: either the old token is marked used and newID stored, or
+// nothing changes, so a failed refresh never burns the client's token.
 //
-// It returns ErrNotFound for an unknown token. When the old token was
-// already used (outside the grace window), revoked or expired it returns
-// ErrTokenReused after revoking every refresh token of the user, because a
-// second use means the token was copied.
-func (r *RefreshTokenRepository) Rotate(ctx context.Context, oldID string, userID int64, newID string, newExpiresAt time.Time) error {
+// A retry within the grace window (the client never received the response)
+// gets back the token that was already issued for oldID, not a new one, so
+// a replayed token cannot start an independent chain: the original client
+// and the replayer then hold the same token, and whichever presents it
+// second triggers reuse detection.
+//
+// It returns ErrNotFound for an unknown token. For a token that was
+// already used (outside the grace window), revoked or expired it revokes
+// every refresh token of the user and returns ErrTokenReused.
+func (r *RefreshTokenRepository) Rotate(ctx context.Context, oldID string, userID int64, newID string, newExpiresAt time.Time) (Rotated, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("rotate refresh token: %w", err)
+		return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
 	}
 	defer tx.Rollback()
 
-	graceSeconds := int64(r.reuseGrace.Round(time.Second) / time.Second)
-	// COALESCE keeps the first-use time, so retries cannot extend the
-	// window. The connection reports matched rows (CLIENT_FOUND_ROWS), so
-	// a retry that changes nothing still counts.
-	res, err := tx.ExecContext(ctx, `UPDATE refresh_token SET used_at = COALESCE(used_at, UTC_TIMESTAMP())
-		WHERE jti = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > UTC_TIMESTAMP()
-		  AND (used_at IS NULL OR (? > 0 AND used_at >= UTC_TIMESTAMP() - INTERVAL ? SECOND))`,
-		oldID, userID, graceSeconds, graceSeconds)
-	if err != nil {
-		return fmt.Errorf("rotate refresh token: %w", err)
+	graceSeconds := int64(r.reuseGrace / time.Second)
+	var (
+		used, revoked, live, inGrace bool
+		replacedBy                   sql.NullString
+	)
+	// Time comparisons run in the database so app/DB clock skew does not
+	// matter. FOR UPDATE serialises concurrent rotations of the same token.
+	err = tx.QueryRowContext(ctx, `SELECT used_at IS NOT NULL, revoked_at IS NOT NULL,
+			expires_at > UTC_TIMESTAMP(),
+			COALESCE(? > 0 AND used_at >= UTC_TIMESTAMP() - INTERVAL ? SECOND, FALSE),
+			replaced_by
+		FROM refresh_token WHERE jti = ? AND user_id = ? FOR UPDATE`,
+		graceSeconds, graceSeconds, oldID, userID).Scan(&used, &revoked, &live, &inGrace, &replacedBy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Rotated{}, ErrNotFound
 	}
-	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("rotate refresh token: %w", err)
+		return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
 	}
 
-	if n == 1 {
+	switch {
+	case !used && !revoked && live:
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE refresh_token SET used_at = UTC_TIMESTAMP(), replaced_by = ? WHERE jti = ?", newID, oldID); err != nil {
+			return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
+		}
 		if err := insertRefreshToken(ctx, tx, newID, userID, newExpiresAt); err != nil {
-			return fmt.Errorf("rotate refresh token: %w", err)
+			return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("rotate refresh token: %w", err)
+			return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
 		}
-		return nil
+		return Rotated{ID: newID, ExpiresAt: newExpiresAt}, nil
+
+	case used && !revoked && live && inGrace && replacedBy.Valid:
+		// Retry: hand back the child, provided it is still unused.
+		var child Rotated
+		var childUsable bool
+		err := tx.QueryRowContext(ctx, `SELECT jti, expires_at,
+				used_at IS NULL AND revoked_at IS NULL AND expires_at > UTC_TIMESTAMP()
+			FROM refresh_token WHERE jti = ? AND user_id = ? FOR UPDATE`,
+			replacedBy.String, userID).Scan(&child.ID, &child.ExpiresAt, &childUsable)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
+		}
+		if err == nil && childUsable {
+			if err := tx.Commit(); err != nil {
+				return Rotated{}, fmt.Errorf("rotate refresh token: %w", err)
+			}
+			return child, nil
+		}
 	}
 
-	var exists bool
-	if err := tx.QueryRowContext(ctx,
-		"SELECT EXISTS (SELECT 1 FROM refresh_token WHERE jti = ? AND user_id = ?)", oldID, userID).Scan(&exists); err != nil {
-		return fmt.Errorf("rotate refresh token: %w", err)
-	}
-	if !exists {
-		return ErrNotFound
-	}
 	if err := revokeAll(ctx, tx, userID); err != nil {
-		return err
+		return Rotated{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("revoke refresh tokens: %w", err)
+		return Rotated{}, fmt.Errorf("revoke refresh tokens: %w", err)
 	}
-	return ErrTokenReused
+	return Rotated{}, ErrTokenReused
 }
 
 // RevokeAll revokes every outstanding refresh token of the user.

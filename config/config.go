@@ -56,16 +56,34 @@ type Config struct {
 	WeatherSigningClientID string
 }
 
-// Load reads the configuration from the environment and validates it.
-func Load() (Config, error) {
-	var errs []error
+// LoadDatabase reads and validates only the database settings. It is all
+// the `migrate` command needs, so that command does not require the API's
+// secrets.
+func LoadDatabase() (Config, error) {
+	var cfg Config
+	return cfg, errors.Join(loadDatabase(&cfg)...)
+}
 
+func loadDatabase(cfg *Config) []error {
+	var errs []error
+	cfg.DBUser = os.Getenv("DB_USERNAME")
+	cfg.DBPassword = os.Getenv("DB_PASSWORD")
+	cfg.DBAddr = getenv("DATABASE_ADDR", "127.0.0.1:3306")
+	cfg.DBName = getenv("DB_DATABASE", "recordings")
+	if cfg.DBUser == "" {
+		errs = append(errs, errors.New("DB_USERNAME is required"))
+	}
+	if cfg.DBPassword == "" {
+		errs = append(errs, errors.New("DB_PASSWORD is required"))
+	}
+	return errs
+}
+
+// Load reads the full API configuration from the environment and validates
+// it.
+func Load() (Config, error) {
 	cfg := Config{
 		HTTPAddr:               getenv("HTTP_ADDR", ":8080"),
-		DBUser:                 os.Getenv("DB_USERNAME"),
-		DBPassword:             os.Getenv("DB_PASSWORD"),
-		DBAddr:                 getenv("DATABASE_ADDR", "127.0.0.1:3306"),
-		DBName:                 getenv("DB_DATABASE", "recordings"),
 		JWTSecret:              os.Getenv("JWT_SECRET"),
 		JWTIssuer:              getenv("JWT_ISSUER", "go-crud"),
 		WeatherAPIKey:          os.Getenv("WEATHER_API_KEY"),
@@ -74,6 +92,7 @@ func Load() (Config, error) {
 		WeatherSigningClientID: os.Getenv("WEATHER_SIGNING_CLIENT_ID"),
 	}
 
+	errs := loadDatabase(&cfg)
 	var err error
 	if cfg.MigrateOnStart, err = strconv.ParseBool(getenv("MIGRATE_ON_START", "true")); err != nil {
 		errs = append(errs, fmt.Errorf("MIGRATE_ON_START: %w", err))
@@ -95,8 +114,8 @@ func Load() (Config, error) {
 	}
 
 	if cfg.RefreshReuseGrace, err = time.ParseDuration(getenv("REFRESH_REUSE_GRACE", "10s")); err != nil ||
-		cfg.RefreshReuseGrace < 0 || cfg.RefreshReuseGrace > time.Minute {
-		errs = append(errs, errors.New("REFRESH_REUSE_GRACE must be a duration between 0s and 1m"))
+		cfg.RefreshReuseGrace < 0 || cfg.RefreshReuseGrace > time.Minute || cfg.RefreshReuseGrace%time.Second != 0 {
+		errs = append(errs, errors.New("REFRESH_REUSE_GRACE must be a whole number of seconds between 0s and 1m"))
 	}
 	for _, p := range strings.Split(os.Getenv("TRUSTED_PROXIES"), ",") {
 		if p = strings.TrimSpace(p); p == "" {
@@ -111,12 +130,6 @@ func Load() (Config, error) {
 		cfg.TrustedProxies = append(cfg.TrustedProxies, p)
 	}
 
-	if cfg.DBUser == "" {
-		errs = append(errs, errors.New("DB_USERNAME is required"))
-	}
-	if cfg.DBPassword == "" {
-		errs = append(errs, errors.New("DB_PASSWORD is required"))
-	}
 	if len(cfg.JWTSecret) < MinJWTSecretLength {
 		errs = append(errs, fmt.Errorf("JWT_SECRET is required and must be at least %d bytes (generate one with: openssl rand -base64 48)", MinJWTSecretLength))
 	}
