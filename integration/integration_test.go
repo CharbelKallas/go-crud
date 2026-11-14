@@ -169,6 +169,7 @@ func TestEndToEnd(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	client := &http.Client{Timeout: 10 * time.Second}
 	call := func(method, path, token string, body any, wantStatus int, out any) {
 		t.Helper()
 		var buf bytes.Buffer
@@ -180,7 +181,7 @@ func TestEndToEnd(t *testing.T) {
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}

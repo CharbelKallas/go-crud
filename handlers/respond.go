@@ -2,6 +2,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/go-playground/validator/v10"
 )
 
@@ -32,9 +34,28 @@ func respondInternal(c *gin.Context, err error) {
 	respondError(c, http.StatusInternalServerError, "internal server error")
 }
 
-// bindJSON decodes and validates the body, answering 400 on failure.
+// normalizer is implemented by payloads that clean their fields (for
+// example trimming whitespace) before validation.
+type normalizer interface {
+	normalize()
+}
+
+// bindJSON decodes the body, normalizes it, then validates it, answering
+// 400 on failure. Normalizing first means rules such as "required" and
+// "email" apply to the value that is actually stored.
 func bindJSON(c *gin.Context, dst any) bool {
-	if err := c.ShouldBindJSON(dst); err != nil {
+	if c.Request.Body == nil {
+		respondError(c, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	if err := json.NewDecoder(c.Request.Body).Decode(dst); err != nil {
+		respondError(c, http.StatusBadRequest, describeBindError(err))
+		return false
+	}
+	if n, ok := dst.(normalizer); ok {
+		n.normalize()
+	}
+	if err := binding.Validator.ValidateStruct(dst); err != nil {
 		respondError(c, http.StatusBadRequest, describeBindError(err))
 		return false
 	}

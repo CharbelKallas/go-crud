@@ -23,7 +23,7 @@ type Deps struct {
 
 func New(d Deps) *gin.Engine {
 	r := gin.New()
-	r.Use(gin.Logger(), gin.Recovery(), middlewares.MaxBodySize(maxBodyBytes))
+	r.Use(middlewares.RequestLogger(), gin.Recovery(), middlewares.MaxBodySize(maxBodyBytes))
 	// The app is not deployed behind a trusted proxy; do not believe
 	// X-Forwarded-For.
 	_ = r.SetTrustedProxies(nil)

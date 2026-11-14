@@ -273,6 +273,7 @@ func TestSignupValidation(t *testing.T) {
 		"short password": map[string]string{"name": "A", "email": "a@example.com", "password": "short"},
 		"long password":  map[string]string{"name": "A", "email": "a@example.com", "password": strings.Repeat("p", 73)},
 		"invalid json":   `{"name":`,
+		"blank name":     map[string]string{"name": "   ", "email": "a@example.com", "password": "longenough"},
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -295,6 +296,16 @@ func TestSignupStoresHashAndRejectsDuplicates(t *testing.T) {
 		t.Fatal("password not stored as a bcrypt hash")
 	}
 	expect(t, h.do("POST", "/api/auth/signup", "", body), http.StatusConflict)
+}
+
+func TestSignupAndLoginTrimWhitespace(t *testing.T) {
+	h := newHarness(t)
+	expect(t, h.do("POST", "/api/auth/signup", "", map[string]string{"name": "  Ann ", "email": " ann@example.com ", "password": "correct horse"}), http.StatusCreated)
+	u, ok := h.users.users["ann@example.com"]
+	if !ok || u.Name != "Ann" {
+		t.Fatalf("stored user = %+v (found %v)", u, ok)
+	}
+	expect(t, h.do("POST", "/api/auth/login", "", map[string]string{"email": "ann@example.com  ", "password": "correct horse"}), http.StatusOK)
 }
 
 func TestLoginFailures(t *testing.T) {

@@ -49,9 +49,18 @@ type SignupPayload struct {
 	Password string `binding:"required,min=8"`
 }
 
+func (p *SignupPayload) normalize() {
+	p.Name = strings.TrimSpace(p.Name)
+	p.Email = strings.TrimSpace(p.Email)
+}
+
 type LoginPayload struct {
 	Email    string `binding:"required"`
 	Password string `binding:"required"`
+}
+
+func (p *LoginPayload) normalize() {
+	p.Email = strings.TrimSpace(p.Email)
 }
 
 type RefreshPayload struct {
@@ -73,7 +82,7 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 		return
 	}
 
-	user := models.User{Name: strings.TrimSpace(p.Name), Email: strings.TrimSpace(p.Email)}
+	user := models.User{Name: p.Name, Email: p.Email}
 	if err := user.HashPassword(p.Password, h.bcryptCost); err != nil {
 		respondInternal(c, err)
 		return
@@ -97,7 +106,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	user, err := h.users.GetByEmail(c.Request.Context(), strings.TrimSpace(p.Email))
+	user, err := h.users.GetByEmail(c.Request.Context(), p.Email)
 	switch {
 	case errors.Is(err, repositories.ErrNotFound):
 		_ = bcrypt.CompareHashAndPassword([]byte(h.dummyHash), []byte(p.Password))
