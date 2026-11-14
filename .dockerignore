@@ -1,0 +1,9 @@
+.git
+.github
+.idea
+.env
+.env.*
+postman
+*.md
+docker-compose.yml
+Dockerfile

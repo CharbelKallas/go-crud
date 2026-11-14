@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        # Keep in sync with docker-compose.yml (Dependabot updates that one).
+        image: mysql:8.4@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-password
+          MYSQL_DATABASE: recordings
+          MYSQL_USER: app
+          MYSQL_PASSWORD: ci-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 --silent"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # Same Go line as the Dockerfile, always on its latest patch
+          # release so govulncheck checks the standard library we ship.
+          go-version: "1.27"
+          check-latest: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - run: go vet ./... && go vet -tags integration ./...
+      - name: Unit tests
+        run: go test -race ./...
+      - name: Integration tests
+        env:
+          INTEGRATION_ALLOW_DB_RESET: "1"
+          DB_USERNAME: app
+          DB_PASSWORD: ci-password
+          DATABASE_ADDR: 127.0.0.1:3306
+          DB_DATABASE: recordings
+        run: go test -race -tags integration ./integration/...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: Docker build
+        run: docker build .

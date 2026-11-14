@@ -1,0 +1,448 @@
+//go:build integration
+
+// Package integration runs the repositories and the full HTTP API against
+// a real MySQL database. Run with:
+//
+//	docker compose up -d mysql
+//	INTEGRATION_ALLOW_DB_RESET=1 DB_USERNAME=... DB_PASSWORD=... DATABASE_ADDR=127.0.0.1:3307 \
+//	  go test -tags integration ./integration/...
+package integration
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
+
+	"go-crud/auth"
+	"go-crud/config"
+	"go-crud/database"
+	"go-crud/handlers"
+	"go-crud/models"
+	"go-crud/repositories"
+	"go-crud/router"
+)
+
+var testDB *sql.DB
+var testCfg config.Config
+
+func TestMain(m *testing.M) {
+	// The tests delete every row in the user and album tables, so they
+	// only run against a database explicitly marked as disposable.
+	if os.Getenv("INTEGRATION_ALLOW_DB_RESET") != "1" {
+		fmt.Println("skipping integration tests: set INTEGRATION_ALLOW_DB_RESET=1 to run them (they wipe the user and album tables)")
+		os.Exit(0)
+	}
+	if os.Getenv("JWT_SECRET") == "" {
+		os.Setenv("JWT_SECRET", strings.Repeat("i", config.MinJWTSecretLength))
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		panic(err)
+	}
+	testCfg = cfg
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	db, err := database.Open(ctx, cfg)
+	if err != nil {
+		panic(err)
+	}
+	// Applying twice must be a no-op.
+	for i := 0; i < 2; i++ {
+		if err := database.Migrate(ctx, cfg); err != nil {
+			panic(err)
+		}
+	}
+	testDB = db
+	code := m.Run()
+	db.Close()
+	os.Exit(code)
+}
+
+func reset(t *testing.T) {
+	t.Helper()
+	for _, table := range []string{"refresh_token", "album", "user"} {
+		if _, err := testDB.Exec("DELETE FROM " + table); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestAlbumRepository(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	repo := repositories.NewAlbumRepository(testDB)
+
+	list, err := repo.List(ctx)
+	if err != nil || list == nil || len(list) != 0 {
+		t.Fatalf("empty list = %#v, %v", list, err)
+	}
+
+	id, err := repo.Create(ctx, models.Album{Title: "Blue Train", Artist: "John Coltrane", Price: 56.99})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.Get(ctx, id)
+	if err != nil || got != (models.Album{ID: id, Title: "Blue Train", Artist: "John Coltrane", Price: 56.99}) {
+		t.Fatalf("get = %+v, %v", got, err)
+	}
+
+	// Updating with identical values must not look like "not found".
+	if err := repo.Update(ctx, id, got); err != nil {
+		t.Fatalf("no-op update: %v", err)
+	}
+	if err := repo.Update(ctx, id+1000, got); !errors.Is(err, repositories.ErrNotFound) {
+		t.Fatalf("update missing: %v", err)
+	}
+
+	byArtist, err := repo.ListByArtist(ctx, "John Coltrane")
+	if err != nil || len(byArtist) != 1 {
+		t.Fatalf("by artist = %v, %v", byArtist, err)
+	}
+
+	if err := repo.Delete(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Delete(ctx, id); !errors.Is(err, repositories.ErrNotFound) {
+		t.Fatalf("second delete: %v", err)
+	}
+	if _, err := repo.Get(ctx, id); !errors.Is(err, repositories.ErrNotFound) {
+		t.Fatalf("get deleted: %v", err)
+	}
+}
+
+func TestEmailCollation(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	repo := repositories.NewUserRepository(testDB)
+	if err := repo.Create(ctx, models.User{Name: "A", Email: "jose@example.com", Password: "h"}); err != nil {
+		t.Fatal(err)
+	}
+	// Accents make a different address...
+	if err := repo.Create(ctx, models.User{Name: "B", Email: "jos\u00e9@example.com", Password: "h"}); err != nil {
+		t.Fatalf("accented email rejected: %v", err)
+	}
+	// ...case does not.
+	if err := repo.Create(ctx, models.User{Name: "C", Email: "JOSE@example.com", Password: "h"}); !errors.Is(err, repositories.ErrDuplicateEmail) {
+		t.Fatalf("case variant: %v", err)
+	}
+	u, err := repo.GetByEmail(ctx, "jose@example.com")
+	if err != nil || u.Name != "A" {
+		t.Fatalf("lookup = %+v, %v", u, err)
+	}
+}
+
+func TestUserRepository(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	repo := repositories.NewUserRepository(testDB)
+
+	u := models.User{Name: "Ann", Email: "ann@example.com", Password: "hash"}
+	if err := repo.Create(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Create(ctx, u); !errors.Is(err, repositories.ErrDuplicateEmail) {
+		t.Fatalf("duplicate: %v", err)
+	}
+	got, err := repo.GetByEmail(ctx, "ann@example.com")
+	if err != nil || got.Name != "Ann" || got.Password != "hash" || got.ID == 0 {
+		t.Fatalf("get = %+v, %v", got, err)
+	}
+	if err := repo.UpdatePasswordHash(ctx, got.ID, "hash2"); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := repo.GetByEmail(ctx, "ann@example.com"); again.Password != "hash2" {
+		t.Fatalf("password not updated: %+v", again)
+	}
+	if _, err := repo.GetByEmail(ctx, "nobody@example.com"); !errors.Is(err, repositories.ErrNotFound) {
+		t.Fatalf("missing: %v", err)
+	}
+}
+
+// TestEndToEnd drives the real router over HTTP with the real repositories.
+func TestEndToEnd(t *testing.T) {
+	reset(t)
+	gin.SetMode(gin.TestMode)
+	tokens := auth.NewTokenManager(testCfg.JWTSecret, testCfg.JWTIssuer, time.Minute, time.Hour)
+	authHandler, err := handlers.NewAuthHandler(repositories.NewUserRepository(testDB), repositories.NewRefreshTokenRepository(testDB, 0), tokens, bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(router.New(router.Deps{
+		Tokens:   tokens,
+		Auth:     authHandler,
+		Albums:   handlers.NewAlbumHandler(repositories.NewAlbumRepository(testDB)),
+		Weather:  handlers.NewWeatherHandler(nil),
+		Health:   handlers.NewHealthCheck(testDB),
+		Sessions: repositories.NewUserRepository(testDB),
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	call := func(method, path, token string, body any, wantStatus int, out any) {
+		t.Helper()
+		var buf bytes.Buffer
+		if body != nil {
+			json.NewEncoder(&buf).Encode(body)
+		}
+		req, _ := http.NewRequest(method, srv.URL+path, &buf)
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != wantStatus {
+			var b bytes.Buffer
+			b.ReadFrom(resp.Body)
+			t.Fatalf("%s %s = %d, want %d: %s", method, path, resp.StatusCode, wantStatus, b.String())
+		}
+		if out != nil {
+			if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	call("GET", "/healthz", "", nil, 200, nil)
+
+	signup := map[string]string{"name": "Ann", "email": "ann@example.com", "password": "correct horse"}
+	call("POST", "/api/auth/signup", "", signup, 201, nil)
+	call("POST", "/api/auth/signup", "", signup, 409, nil)
+
+	var login handlers.LoginResponse
+	call("POST", "/api/auth/login", "", map[string]string{"email": "ann@example.com", "password": "nope-nope"}, 401, nil)
+	call("POST", "/api/auth/login", "", map[string]string{"email": "ann@example.com", "password": "correct horse"}, 200, &login)
+
+	var empty []models.Album
+	call("GET", "/api/albums", login.Token, nil, 200, &empty)
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("empty list = %#v", empty)
+	}
+
+	var id int64
+	call("POST", "/api/albums", login.Token, map[string]any{"title": "Blue Train", "artist": "John Coltrane", "price": 56.99}, 201, &id)
+	var album models.Album
+	call("GET", "/api/albums/"+itoa(id), login.Token, nil, 200, &album)
+	if album.Title != "Blue Train" || album.Price != 56.99 {
+		t.Fatalf("album = %+v", album)
+	}
+	call("PUT", "/api/albums/"+itoa(id), login.Token, map[string]any{"title": "Blue Train", "artist": "John Coltrane", "price": 56.99}, 200, nil)
+	call("PUT", "/api/albums/"+itoa(id), login.Token, map[string]any{"title": "Blue Train", "artist": "John Coltrane", "price": 60}, 200, nil)
+	var byArtist []models.Album
+	call("GET", "/api/albums/artist/John%20Coltrane", login.Token, nil, 200, &byArtist)
+	if len(byArtist) != 1 || byArtist[0].Price != 60 {
+		t.Fatalf("by artist = %+v", byArtist)
+	}
+	call("DELETE", "/api/albums/"+itoa(id), login.Token, nil, 200, nil)
+	call("GET", "/api/albums/"+itoa(id), login.Token, nil, 404, nil)
+
+	// Refresh flow.
+	call("GET", "/api/albums", login.RefreshToken, nil, 401, nil)
+	var refreshed handlers.LoginResponse
+	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": login.RefreshToken}, 200, &refreshed)
+	call("GET", "/api/albums", refreshed.Token, nil, 200, nil)
+
+	// Reusing a refresh token ends every session: all refresh tokens and
+	// the access tokens issued so far.
+	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": login.RefreshToken}, 401, nil)
+	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": refreshed.RefreshToken}, 401, nil)
+	call("GET", "/api/albums", login.Token, nil, 401, nil)
+	call("GET", "/api/albums", refreshed.Token, nil, 401, nil)
+
+	// A fresh login works again, and an old revoked token presented again
+	// does not log the user out a second time.
+	var again handlers.LoginResponse
+	call("POST", "/api/auth/login", "", map[string]string{"email": "ann@example.com", "password": "correct horse"}, 200, &again)
+	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": refreshed.RefreshToken}, 401, nil)
+	call("GET", "/api/albums", again.Token, nil, 200, nil)
+	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": again.RefreshToken}, 200, nil)
+}
+
+func TestRefreshTokenRepository(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	users := repositories.NewUserRepository(testDB)
+	if err := users.Create(ctx, models.User{Name: "A", Email: "a@example.com", Password: "h"}); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := users.GetByEmail(ctx, "a@example.com")
+	future := time.Now().Add(time.Hour)
+	count := func(where string) int {
+		t.Helper()
+		var n int
+		if err := testDB.QueryRow("SELECT COUNT(*) FROM refresh_token WHERE " + where).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	t.Run("strict single use and family revocation", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 0)
+		for _, id := range []string{"s1", "s2"} {
+			if err := repo.Save(ctx, id, u.ID, future); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := repo.Rotate(ctx, "s1", u.ID+1, "x", future); !errors.Is(err, repositories.ErrNotFound) {
+			t.Fatalf("other user's token: %v", err)
+		}
+		if _, err := repo.Rotate(ctx, "s1", u.ID, "s1-next", future); err != nil {
+			t.Fatalf("first use: %v", err)
+		}
+		if count("jti = 's1-next'") != 1 {
+			t.Fatal("new token not stored")
+		}
+		if _, err := repo.Rotate(ctx, "s1", u.ID, "s1-again", future); !errors.Is(err, repositories.ErrTokenReused) {
+			t.Fatalf("second use: %v", err)
+		}
+		if count("jti = 's1-again'") != 0 {
+			t.Fatal("token stored for a rejected rotation")
+		}
+		for _, id := range []string{"s2", "s1-next"} {
+			if _, err := repo.Rotate(ctx, id, u.ID, id+"-x", future); !errors.Is(err, repositories.ErrTokenRevoked) {
+				t.Fatalf("%s not revoked: %v", id, err)
+			}
+		}
+		if v, err := users.SessionVersion(ctx, u.ID); err != nil || v != 1 {
+			t.Fatalf("session version = %d, %v; want 1", v, err)
+		}
+		if _, err := repo.Rotate(ctx, "nope", u.ID, "y", future); !errors.Is(err, repositories.ErrNotFound) {
+			t.Fatalf("unknown: %v", err)
+		}
+	})
+
+	t.Run("failed insert rolls back the consume", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 0)
+		if err := repo.Save(ctx, "r1", u.ID, future); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, "taken", u.ID, future); err != nil {
+			t.Fatal(err)
+		}
+		// Duplicate new ID makes the INSERT fail inside the transaction.
+		if _, err := repo.Rotate(ctx, "r1", u.ID, "taken", future); err == nil {
+			t.Fatal("expected an error")
+		}
+		if _, err := repo.Rotate(ctx, "r1", u.ID, "r1-next", future); err != nil {
+			t.Fatalf("token burned by a failed rotation: %v", err)
+		}
+	})
+
+	t.Run("grace retry returns the same child", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 10*time.Second)
+		if err := repo.Save(ctx, "g1", u.ID, future); err != nil {
+			t.Fatal(err)
+		}
+		first, err := repo.Rotate(ctx, "g1", u.ID, "g1-a", future)
+		if err != nil || first.ID != "g1-a" {
+			t.Fatalf("first = %+v, %v", first, err)
+		}
+		retry, err := repo.Rotate(ctx, "g1", u.ID, "g1-b", future)
+		if err != nil || retry.ID != "g1-a" || !retry.ExpiresAt.Equal(first.ExpiresAt.UTC().Round(time.Second)) {
+			t.Fatalf("retry = %+v (first %+v), %v", retry, first, err)
+		}
+		if count("jti = 'g1-b'") != 0 {
+			t.Fatal("retry stored a second child")
+		}
+		// After the child is used, replaying the parent is theft.
+		if _, err := repo.Rotate(ctx, "g1-a", u.ID, "g1-a1", future); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.Rotate(ctx, "g1", u.ID, "g1-c", future); !errors.Is(err, repositories.ErrTokenReused) {
+			t.Fatalf("replay after child used: %v", err)
+		}
+	})
+
+	t.Run("grace window expires", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 10*time.Second)
+		if err := repo.Save(ctx, "e1", u.ID, future); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.Rotate(ctx, "e1", u.ID, "e1-a", future); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testDB.Exec("UPDATE refresh_token SET used_at = UTC_TIMESTAMP() - INTERVAL 1 MINUTE WHERE jti = 'e1'"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.Rotate(ctx, "e1", u.ID, "e1-b", future); !errors.Is(err, repositories.ErrTokenReused) {
+			t.Fatalf("retry after grace: %v", err)
+		}
+	})
+
+	t.Run("expired token is rejected without revoking", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 0)
+		if err := repo.Save(ctx, "x-old", u.ID, time.Now().Add(-time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, "x-live", u.ID, future); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.Rotate(ctx, "x-old", u.ID, "x-old-next", future); !errors.Is(err, repositories.ErrNotFound) {
+			t.Fatalf("expired: %v", err)
+		}
+		if _, err := repo.Rotate(ctx, "x-live", u.ID, "x-live-next", future); err != nil {
+			t.Fatalf("sibling revoked by an expired token: %v", err)
+		}
+	})
+
+	t.Run("revocation survives a cancelled request", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 0)
+		for _, id := range []string{"c1", "c2"} {
+			if err := repo.Save(ctx, id, u.ID, future); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := repo.Rotate(ctx, "c1", u.ID, "c1-next", future); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := users.SessionVersion(ctx, u.ID)
+		// The client hangs up just as the reuse is detected.
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		_, err := repo.Rotate(cancelled, "c1", u.ID, "c1-again", future)
+		if !errors.Is(err, repositories.ErrTokenReused) {
+			t.Fatalf("err = %v", err)
+		}
+		if after, _ := users.SessionVersion(ctx, u.ID); after != before+1 {
+			t.Fatalf("session version %d -> %d: revocation skipped", before, after)
+		}
+	})
+
+	t.Run("prune and cascade", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 0)
+		if err := repo.Save(ctx, "old", u.ID, time.Now().Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Prune(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if count("jti = 'old'") != 0 {
+			t.Fatal("expired token not pruned")
+		}
+		if _, err := testDB.Exec("DELETE FROM user WHERE id = ?", u.ID); err != nil {
+			t.Fatal(err)
+		}
+		if n := count("1=1"); n != 0 {
+			t.Fatalf("%d tokens left after user deletion", n)
+		}
+	})
+}
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }

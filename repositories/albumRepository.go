@@ -1,105 +1,106 @@
 package repositories
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+
 	"go-crud/models"
 )
 
-func Albums() ([]models.Album, error) {
-	var albums []models.Album
+const albumColumns = "id, title, artist, price"
 
-	rows, err := Db.Query("SELECT * FROM album")
-	if err != nil {
-		return nil, fmt.Errorf("albums: %v", err)
-	}
-	defer func(rows *sql.Rows) {
-		err := rows.Close()
-		if err != nil {
-
-		}
-	}(rows)
-
-	for rows.Next() {
-		var alb models.Album
-		if err := rows.Scan(&alb.ID, &alb.Title, &alb.Artist, &alb.Price); err != nil {
-			return nil, fmt.Errorf("albums: %v", err)
-		}
-		albums = append(albums, alb)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("albums: %v", err)
-	}
-	return albums, nil
-}
-func AlbumsByArtist(name string) ([]models.Album, error) {
-	var albums []models.Album
-
-	rows, err := Db.Query("SELECT * FROM album WHERE artist = ?", name)
-	if err != nil {
-		return nil, fmt.Errorf("albumsByArtist %q: %v", name, err)
-	}
-	defer func(rows *sql.Rows) {
-		err := rows.Close()
-		if err != nil {
-
-		}
-	}(rows)
-
-	for rows.Next() {
-		var alb models.Album
-		if err := rows.Scan(&alb.ID, &alb.Title, &alb.Artist, &alb.Price); err != nil {
-			return nil, fmt.Errorf("albumsByArtist %q: %v", name, err)
-		}
-		albums = append(albums, alb)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("albumsByArtist %q: %v", name, err)
-	}
-	return albums, nil
+type AlbumRepository struct {
+	db *sql.DB
 }
 
-func AlbumByID(id int64) (models.Album, error) {
+func NewAlbumRepository(db *sql.DB) *AlbumRepository {
+	return &AlbumRepository{db: db}
+}
+
+// List returns every album, ordered by id. It never returns a nil slice so
+// an empty result is rendered as [] rather than null.
+func (r *AlbumRepository) List(ctx context.Context) ([]models.Album, error) {
+	return r.query(ctx, "SELECT "+albumColumns+" FROM album ORDER BY id")
+}
+
+func (r *AlbumRepository) ListByArtist(ctx context.Context, artist string) ([]models.Album, error) {
+	return r.query(ctx, "SELECT "+albumColumns+" FROM album WHERE artist = ? ORDER BY id", artist)
+}
+
+func (r *AlbumRepository) Get(ctx context.Context, id int64) (models.Album, error) {
 	var alb models.Album
-
-	row := Db.QueryRow("SELECT * FROM album WHERE id = ?", id)
-	if err := row.Scan(&alb.ID, &alb.Title, &alb.Artist, &alb.Price); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return alb, fmt.Errorf("albumsById %d: no such album", id)
-		}
-		return alb, fmt.Errorf("albumsById %d: %v", id, err)
+	err := r.db.QueryRowContext(ctx, "SELECT "+albumColumns+" FROM album WHERE id = ?", id).
+		Scan(&alb.ID, &alb.Title, &alb.Artist, &alb.Price)
+	if errors.Is(err, sql.ErrNoRows) {
+		return alb, ErrNotFound
+	}
+	if err != nil {
+		return alb, fmt.Errorf("get album %d: %w", id, err)
 	}
 	return alb, nil
 }
 
-func AddAlbum(alb models.Album) (int64, error) {
-	result, err := Db.Exec("INSERT INTO album (title, artist, price) VALUES (?, ?, ?)", alb.Title, alb.Artist, alb.Price)
+func (r *AlbumRepository) Create(ctx context.Context, alb models.Album) (int64, error) {
+	res, err := r.db.ExecContext(ctx, "INSERT INTO album (title, artist, price) VALUES (?, ?, ?)", alb.Title, alb.Artist, alb.Price)
 	if err != nil {
-		return 0, fmt.Errorf("addAlbum: %v", err)
+		return 0, fmt.Errorf("create album: %w", err)
 	}
-	id, err := result.LastInsertId()
+	id, err := res.LastInsertId()
 	if err != nil {
-		return 0, fmt.Errorf("addAlbum: %v", err)
+		return 0, fmt.Errorf("create album: %w", err)
 	}
 	return id, nil
 }
 
-func AlbumUpdate(id int64, alb models.Album) (int64, error) {
-	_, err := Db.Exec("UPDATE album set title = ?, artist = ?, price = ? where id = ?", alb.Title, alb.Artist, alb.Price, id)
-
+// Update replaces the album's fields. It returns ErrNotFound when no album
+// has the id. The connection uses CLIENT_FOUND_ROWS, so an update that
+// changes nothing still counts the matched row.
+func (r *AlbumRepository) Update(ctx context.Context, id int64, alb models.Album) error {
+	res, err := r.db.ExecContext(ctx, "UPDATE album SET title = ?, artist = ?, price = ? WHERE id = ?", alb.Title, alb.Artist, alb.Price, id)
 	if err != nil {
-		return 0, fmt.Errorf("addAlbum: %v", err)
+		return fmt.Errorf("update album %d: %w", id, err)
 	}
-
-	return id, nil
+	return expectOneRow(res, "update album", id)
 }
-func DeleteAlbum(id int64) (int64, error) {
-	_, err := Db.Exec("DELETE FROM album WHERE id = ?", id)
 
+func (r *AlbumRepository) Delete(ctx context.Context, id int64) error {
+	res, err := r.db.ExecContext(ctx, "DELETE FROM album WHERE id = ?", id)
 	if err != nil {
-		return 0, fmt.Errorf("DeleteAlbum: %v", err)
+		return fmt.Errorf("delete album %d: %w", id, err)
 	}
+	return expectOneRow(res, "delete album", id)
+}
 
-	return id, nil
+func (r *AlbumRepository) query(ctx context.Context, q string, args ...any) ([]models.Album, error) {
+	rows, err := r.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list albums: %w", err)
+	}
+	defer rows.Close()
+
+	albums := []models.Album{}
+	for rows.Next() {
+		var alb models.Album
+		if err := rows.Scan(&alb.ID, &alb.Title, &alb.Artist, &alb.Price); err != nil {
+			return nil, fmt.Errorf("list albums: %w", err)
+		}
+		albums = append(albums, alb)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list albums: %w", err)
+	}
+	return albums, nil
+}
+
+func expectOneRow(res sql.Result, op string, id int64) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s %d: %w", op, id, err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

@@ -16,48 +16,34 @@
 						"value": "application/json"
 					}
 				],
-				"body": {
-					"mode": "raw",
-					"raw": "{\r\n    \"name\": \"charbelkallas\",\r\n    \"email\": \"ckallas@gmail.com\",\r\n    \"password\": \"charbelkallas\"\r\n}"
-				},
 				"url": {
-					"raw": "http://localhost:8080/api/auth/signup",
-					"protocol": "http",
+					"raw": "{{baseUrl}}/api/auth/signup",
 					"host": [
-						"localhost"
+						"{{baseUrl}}"
 					],
-					"port": "8080",
 					"path": [
 						"api",
 						"auth",
 						"signup"
 					]
+				},
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"name\": \"Demo User\",\n    \"email\": \"demo@example.com\",\n    \"password\": \"change-me-please\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"auth": {
+					"type": "noauth"
 				}
 			},
 			"response": []
 		},
 		{
 			"name": "user login",
-			"event": [
-				{
-					"listen": "prerequest",
-					"script": {
-						"exec": [
-							""
-						],
-						"type": "text/javascript"
-					}
-				},
-				{
-					"listen": "test",
-					"script": {
-						"exec": [
-							"pm.environment.set(\"token\", pm.response.json().RefreshToken);"
-						],
-						"type": "text/javascript"
-					}
-				}
-			],
 			"request": {
 				"method": "POST",
 				"header": [
@@ -66,29 +52,123 @@
 						"value": "application/json"
 					}
 				],
-				"body": {
-					"mode": "raw",
-					"raw": "{\r\n    \"email\": \"ckallas@gmail.com\",\r\n    \"password\": \"charbelkallas\"\r\n}"
-				},
 				"url": {
-					"raw": "http://localhost:8080/api/auth/login",
-					"protocol": "http",
+					"raw": "{{baseUrl}}/api/auth/login",
 					"host": [
-						"localhost"
+						"{{baseUrl}}"
 					],
-					"port": "8080",
 					"path": [
 						"api",
 						"auth",
 						"login"
 					]
+				},
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"email\": \"demo@example.com\",\n    \"password\": \"change-me-please\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"auth": {
+					"type": "noauth"
 				}
 			},
-			"response": []
+			"response": [],
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"type": "text/javascript",
+						"exec": [
+							"const body = pm.response.json();",
+							"pm.collectionVariables.set(\"token\", body.Token);",
+							"pm.collectionVariables.set(\"refreshToken\", body.RefreshToken);"
+						]
+					}
+				}
+			]
+		},
+		{
+			"name": "refresh tokens",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/api/auth/refresh",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"auth",
+						"refresh"
+					]
+				},
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"RefreshToken\": \"{{refreshToken}}\"\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"auth": {
+					"type": "noauth"
+				}
+			},
+			"response": [],
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"type": "text/javascript",
+						"exec": [
+							"const body = pm.response.json();",
+							"pm.collectionVariables.set(\"token\", body.Token);",
+							"pm.collectionVariables.set(\"refreshToken\", body.RefreshToken);"
+						]
+					}
+				}
+			]
 		},
 		{
 			"name": "create album",
 			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/api/albums",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"albums"
+					]
+				},
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"title\": \"Blue Train\",\n    \"artist\": \"John Coltrane\",\n    \"price\": 56.99\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
 				"auth": {
 					"type": "bearer",
 					"bearer": [
@@ -97,29 +177,6 @@
 							"value": "{{token}}",
 							"type": "string"
 						}
-					]
-				},
-				"method": "POST",
-				"header": [
-					{
-						"key": "Content-Type",
-						"value": "application/json"
-					}
-				],
-				"body": {
-					"mode": "raw",
-					"raw": "{\r\n    \"title\": \"test\",\r\n    \"artist\": \"test\",\r\n    \"price\": 1\r\n}"
-				},
-				"url": {
-					"raw": "http://localhost:8080/api/albums",
-					"protocol": "http",
-					"host": [
-						"localhost"
-					],
-					"port": "8080",
-					"path": [
-						"api",
-						"albums"
 					]
 				}
 			},
@@ -128,6 +185,33 @@
 		{
 			"name": "update album",
 			"request": {
+				"method": "PUT",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/api/albums/1",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"albums",
+						"1"
+					]
+				},
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"title\": \"Blue Train\",\n    \"artist\": \"John Coltrane\",\n    \"price\": 59.99\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
 				"auth": {
 					"type": "bearer",
 					"bearer": [
@@ -136,30 +220,6 @@
 							"value": "{{token}}",
 							"type": "string"
 						}
-					]
-				},
-				"method": "POST",
-				"header": [],
-				"body": {
-					"mode": "raw",
-					"raw": "{\r\n    \"title\": \"test12\",\r\n    \"artist\": \"test12\",\r\n    \"price\": 1\r\n}",
-					"options": {
-						"raw": {
-							"language": "json"
-						}
-					}
-				},
-				"url": {
-					"raw": "http://localhost:8080/api/albums/6",
-					"protocol": "http",
-					"host": [
-						"localhost"
-					],
-					"port": "8080",
-					"path": [
-						"api",
-						"albums",
-						"6"
 					]
 				}
 			},
@@ -168,6 +228,23 @@
 		{
 			"name": "get all albums",
 			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/api/albums",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"albums"
+					]
+				},
 				"auth": {
 					"type": "bearer",
 					"bearer": [
@@ -176,20 +253,6 @@
 							"value": "{{token}}",
 							"type": "string"
 						}
-					]
-				},
-				"method": "GET",
-				"header": [],
-				"url": {
-					"raw": "http://localhost:8080/api/albums",
-					"protocol": "http",
-					"host": [
-						"localhost"
-					],
-					"port": "8080",
-					"path": [
-						"api",
-						"albums"
 					]
 				}
 			},
@@ -198,6 +261,24 @@
 		{
 			"name": "get album by id",
 			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/api/albums/1",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"albums",
+						"1"
+					]
+				},
 				"auth": {
 					"type": "bearer",
 					"bearer": [
@@ -206,21 +287,6 @@
 							"value": "{{token}}",
 							"type": "string"
 						}
-					]
-				},
-				"method": "GET",
-				"header": [],
-				"url": {
-					"raw": "http://localhost:8080/api/albums/6",
-					"protocol": "http",
-					"host": [
-						"localhost"
-					],
-					"port": "8080",
-					"path": [
-						"api",
-						"albums",
-						"6"
 					]
 				}
 			},
@@ -229,6 +295,25 @@
 		{
 			"name": "get album by artist",
 			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/api/albums/artist/John Coltrane",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"albums",
+						"artist",
+						"John Coltrane"
+					]
+				},
 				"auth": {
 					"type": "bearer",
 					"bearer": [
@@ -237,22 +322,6 @@
 							"value": "{{token}}",
 							"type": "string"
 						}
-					]
-				},
-				"method": "GET",
-				"header": [],
-				"url": {
-					"raw": "http://localhost:8080/api/albums/artist/John Coltrane",
-					"protocol": "http",
-					"host": [
-						"localhost"
-					],
-					"port": "8080",
-					"path": [
-						"api",
-						"albums",
-						"artist",
-						"John Coltrane"
 					]
 				}
 			},
@@ -261,6 +330,24 @@
 		{
 			"name": "delete album",
 			"request": {
+				"method": "DELETE",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/api/albums/1",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"albums",
+						"1"
+					]
+				},
 				"auth": {
 					"type": "bearer",
 					"bearer": [
@@ -269,21 +356,6 @@
 							"value": "{{token}}",
 							"type": "string"
 						}
-					]
-				},
-				"method": "DELETE",
-				"header": [],
-				"url": {
-					"raw": "http://localhost:8080/api/albums/6",
-					"protocol": "http",
-					"host": [
-						"localhost"
-					],
-					"port": "8080",
-					"path": [
-						"api",
-						"albums",
-						"6"
 					]
 				}
 			},
@@ -292,6 +364,25 @@
 		{
 			"name": "current weather",
 			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/api/weather/33.8938/35.5018",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"weather",
+						"33.8938",
+						"35.5018"
+					]
+				},
 				"auth": {
 					"type": "bearer",
 					"bearer": [
@@ -301,25 +392,48 @@
 							"type": "string"
 						}
 					]
-				},
-				"method": "GET",
-				"header": [],
-				"url": {
-					"raw": "http://localhost:8080/api/weather/33.8938/35.5018",
-					"protocol": "http",
-					"host": [
-						"localhost"
-					],
-					"port": "8080",
-					"path": [
-						"api",
-						"weather",
-						"33.8938",
-						"35.5018"
-					]
 				}
 			},
 			"response": []
+		},
+		{
+			"name": "health",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/healthz",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"healthz"
+					]
+				},
+				"auth": {
+					"type": "noauth"
+				}
+			},
+			"response": []
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8080"
+		},
+		{
+			"key": "token",
+			"value": ""
+		},
+		{
+			"key": "refreshToken",
+			"value": ""
 		}
 	]
 }

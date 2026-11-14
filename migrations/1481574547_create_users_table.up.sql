@@ -1,4 +1,4 @@
-create table if not exists recordings.user
+create table if not exists user
 (
     id       int auto_increment
         primary key,
@@ -7,7 +7,7 @@ create table if not exists recordings.user
     password varchar(255) not null
 );
 
-create table if not exists recordings.album
+create table if not exists album
 (
     id     int auto_increment
         primary key,
@@ -15,4 +15,3 @@ create table if not exists recordings.album
     artist varchar(255)  not null,
     price  decimal(5, 2) not null
 );
-

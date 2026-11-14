@@ -1,0 +1,138 @@
+package auth
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+const testSecret = "test-secret-that-is-at-least-32-bytes-long"
+
+var ann = Subject{UserID: 7, Email: "a@example.com", SessionVersion: 2}
+
+func newManager() *TokenManager {
+	return NewTokenManager(testSecret, "go-crud-test", 15*time.Minute, 12*time.Hour)
+}
+
+func TestGenerateAndValidate(t *testing.T) {
+	m := newManager()
+	for _, typ := range []TokenType{AccessToken, RefreshToken} {
+		tok, err := m.Generate(ann, typ)
+		if err != nil {
+			t.Fatalf("generate %s: %v", typ, err)
+		}
+		claims, err := m.Validate(tok, typ)
+		if err != nil {
+			t.Fatalf("validate %s: %v", typ, err)
+		}
+		if claims.Email != "a@example.com" || claims.UserID != 7 || claims.Subject != "7" || claims.SessionVersion != 2 || claims.Type != typ || len(claims.ID) != 32 {
+			t.Errorf("unexpected claims %+v", claims)
+		}
+	}
+}
+
+func TestIssueReturnsUniqueIDs(t *testing.T) {
+	m := newManager()
+	a, err := m.Issue(ann, RefreshToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := m.Issue(ann, RefreshToken)
+	if a.ID == b.ID || a.Token == b.Token {
+		t.Fatal("tokens issued in the same second are identical")
+	}
+	claims, err := m.Validate(a.Token, RefreshToken)
+	if err != nil || claims.ID != a.ID || !claims.ExpiresAt.Time.Equal(a.ExpiresAt.Truncate(time.Second)) {
+		t.Fatalf("claims = %+v, issued = %+v, err = %v", claims, a, err)
+	}
+}
+
+func TestIssueWithIDReissuesSameToken(t *testing.T) {
+	m := newManager()
+	orig, _ := m.Issue(ann, RefreshToken)
+	again, err := m.IssueWithID(ann, RefreshToken, orig.ID, orig.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := m.Validate(again.Token, RefreshToken)
+	if err != nil || claims.ID != orig.ID || claims.ExpiresAt.Unix() != orig.ExpiresAt.Unix() {
+		t.Fatalf("claims = %+v, err = %v", claims, err)
+	}
+}
+
+func TestTokenTypeIsEnforced(t *testing.T) {
+	m := newManager()
+	refresh, _ := m.Generate(ann, RefreshToken)
+	if _, err := m.Validate(refresh, AccessToken); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("refresh token accepted as access token: %v", err)
+	}
+	access, _ := m.Generate(ann, AccessToken)
+	if _, err := m.Validate(access, RefreshToken); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("access token accepted as refresh token: %v", err)
+	}
+}
+
+func TestExpiredTokenRejected(t *testing.T) {
+	m := newManager()
+	m.now = func() time.Time { return time.Now().Add(-time.Hour) }
+	tok, _ := m.Generate(ann, AccessToken)
+	m.now = time.Now
+	if _, err := m.Validate(tok, AccessToken); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("expired token accepted: %v", err)
+	}
+}
+
+func TestWrongSecretRejected(t *testing.T) {
+	other := NewTokenManager("another-secret-that-is-at-least-32-bytes", "go-crud-test", time.Minute, time.Hour)
+	tok, _ := other.Generate(ann, AccessToken)
+	if _, err := newManager().Validate(tok, AccessToken); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("token signed with another secret accepted: %v", err)
+	}
+}
+
+func TestWrongIssuerRejected(t *testing.T) {
+	other := NewTokenManager(testSecret, "someone-else", time.Minute, time.Hour)
+	tok, _ := other.Generate(ann, AccessToken)
+	if _, err := newManager().Validate(tok, AccessToken); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("token from another issuer accepted: %v", err)
+	}
+}
+
+func TestOtherAlgorithmsRejected(t *testing.T) {
+	claims := Claims{UserID: 7, Email: "a@example.com", Type: AccessToken, RegisteredClaims: jwt.RegisteredClaims{
+		ID: "id", Issuer: "go-crud-test", ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}}
+	none, err := jwt.NewWithClaims(jwt.SigningMethodNone, claims).SignedString(jwt.UnsafeAllowNoneSignatureType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs512, _ := jwt.NewWithClaims(jwt.SigningMethodHS512, claims).SignedString([]byte(testSecret))
+	for name, tok := range map[string]string{"none": none, "HS512": hs512} {
+		if _, err := newManager().Validate(tok, AccessToken); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("%s token accepted: %v", name, err)
+		}
+	}
+}
+
+func TestTokenWithoutExpiryRejected(t *testing.T) {
+	claims := Claims{UserID: 7, Email: "a@example.com", Type: AccessToken, RegisteredClaims: jwt.RegisteredClaims{ID: "id", Issuer: "go-crud-test"}}
+	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(testSecret))
+	if _, err := newManager().Validate(tok, AccessToken); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("token without exp accepted: %v", err)
+	}
+}
+
+func TestTokenWithoutUserRejected(t *testing.T) {
+	claims := Claims{Email: "a@example.com", Type: AccessToken, RegisteredClaims: jwt.RegisteredClaims{
+		ID: "id", Issuer: "go-crud-test", ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}}
+	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(testSecret))
+	if _, err := newManager().Validate(tok, AccessToken); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("token without uid accepted: %v", err)
+	}
+	if _, err := newManager().Issue(Subject{Email: "a@example.com"}, AccessToken); err == nil {
+		t.Fatal("issued a token without a user ID")
+	}
+}

@@ -1,24 +1,80 @@
-version: '3'
+# Secrets come from a .env file next to this one (copy .env.example to .env
+# and fill it in). Compose refuses to start when a required value is missing.
+name: go-crud
+
+x-app-env: &app-env
+  DB_USERNAME: ${DB_USERNAME}
+  DB_PASSWORD: ${DB_PASSWORD}
+  DB_DATABASE: ${DB_DATABASE:-recordings}
+  DATABASE_ADDR: mysql:3306
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+  ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-15m}
+  REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL:-12h}
+  REFRESH_REUSE_GRACE: ${REFRESH_REUSE_GRACE:-10s}
+  AUTH_RATE_LIMIT_PER_MINUTE: ${AUTH_RATE_LIMIT_PER_MINUTE:-10}
+  TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+  WEATHER_API_KEY: ${WEATHER_API_KEY:-}
+  WEATHER_SIGNING_SECRET: ${WEATHER_SIGNING_SECRET:-}
+  WEATHER_SIGNING_CLIENT_ID: ${WEATHER_SIGNING_CLIENT_ID:-}
 
 services:
   mysql:
-    image: mysql:latest
-    container_name: my-mysql-container
-    ports:
-      - "3307:3306"
+    # Pinned by digest; Dependabot (.github/dependabot.yml) proposes updates.
+    image: mysql:8.4@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: charbelkallas
-      MYSQL_DATABASE: recordings
-      MYSQL_USER: charbelkallas
-      MYSQL_PASSWORD: charbelkallas
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${DB_DATABASE:-recordings}
+      MYSQL_USER: ${DB_USERNAME:?set DB_USERNAME in .env}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    # Published on the loopback interface only, for local tools and the
+    # integration tests.
+    ports:
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # No credentials needed: ping succeeds as soon as the server accepts
+      # TCP connections, which the init-time temporary server does not.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # One-shot: applies migrations, then exits. The API only starts once it
+  # has succeeded, so a failed migration stops `docker compose up` with a
+  # clear error instead of crash-looping the API.
+  migrate:
+    # Builds the image the app also uses. The build lives here because the
+    # app depends on this service, so `docker compose up`, `run app` and
+    # `run migrate` all build it, and only once.
+    image: go-crud:local
+    build: .
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment: *app-env
 
   app:
-    container_name: go-crud
-    build: .
+    # Built by the migrate service; never pulled from a registry.
+    image: go-crud:local
+    pull_policy: never
+    # Comes back after a crash or a Docker/host restart. Migrations are not
+    # re-run on those restarts; the `migrate` service owns them.
+    restart: unless-stopped
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
-      DB_USERNAME: charbelkallas
-      DB_PASSWORD: charbelkallas
-      DB_DATABASE: recordings
-      DATABASE_ADDR: mysql:3306
+      <<: *app-env
+      MIGRATE_ON_START: "false"
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  mysql-data:
