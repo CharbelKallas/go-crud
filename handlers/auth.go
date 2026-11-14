@@ -38,6 +38,9 @@ type AuthHandler struct {
 	refresh    RefreshTokenStore
 	tokens     *auth.TokenManager
 	bcryptCost int
+	// onSessionsRevoked, if set, is called after a user's sessions were
+	// revoked (refresh token reuse), e.g. to drop cached session state.
+	onSessionsRevoked func(userID int64)
 	// dummyHash is compared against when the user does not exist, so a
 	// login for an unknown email takes as long as one with a wrong
 	// password and does not reveal which emails are registered.
@@ -50,6 +53,12 @@ func NewAuthHandler(users UserStore, refresh RefreshTokenStore, tokens *auth.Tok
 		return nil, err
 	}
 	return &AuthHandler{users: users, refresh: refresh, tokens: tokens, bcryptCost: bcryptCost, dummyHash: string(dummy)}, nil
+}
+
+// OnSessionsRevoked registers f to be called after this handler revokes a
+// user's sessions.
+func (h *AuthHandler) OnSessionsRevoked(f func(userID int64)) {
+	h.onSessionsRevoked = f
 }
 
 type SignupPayload struct {
@@ -185,6 +194,9 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	switch {
 	case errors.Is(err, repositories.ErrTokenReused):
 		slog.WarnContext(c.Request.Context(), "refresh token reused; revoked all sessions of the user", "user_id", user.ID)
+		if h.onSessionsRevoked != nil {
+			h.onSessionsRevoked(user.ID)
+		}
 		respondError(c, http.StatusUnauthorized, "invalid refresh token")
 		return
 	case errors.Is(err, repositories.ErrNotFound), errors.Is(err, repositories.ErrTokenRevoked):

@@ -51,3 +51,12 @@ func (c *CachedSessions) SessionVersion(ctx context.Context, userID int64) (int6
 	c.mu.Unlock()
 	return v, nil
 }
+
+// Invalidate drops the cached version for a user, so a revocation made by
+// this instance applies to its next request immediately. (Other instances
+// still pick it up within ttl.)
+func (c *CachedSessions) Invalidate(userID int64) {
+	c.mu.Lock()
+	delete(c.entries, userID)
+	c.mu.Unlock()
+}

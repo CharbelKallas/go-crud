@@ -112,13 +112,16 @@ func serve() error {
 		slog.Warn("WEATHER_API_KEY not set: /api/weather will answer 503")
 	}
 
+	sessions := middlewares.NewCachedSessions(users, sessionCacheTTL)
+	authHandler.OnSessionsRevoked(sessions.Invalidate)
+
 	engine := router.New(router.Deps{
 		Tokens:   tokens,
 		Auth:     authHandler,
 		Albums:   handlers.NewAlbumHandler(repositories.NewAlbumRepository(db)),
 		Weather:  handlers.NewWeatherHandler(weatherProvider),
 		Health:   health,
-		Sessions: middlewares.NewCachedSessions(users, sessionCacheTTL),
+		Sessions: sessions,
 
 		AuthRateLimitPerMinute: cfg.AuthRateLimitPerMinute,
 		TrustedProxies:         cfg.TrustedProxies,

@@ -39,6 +39,12 @@ func TestCachedSessions(t *testing.T) {
 		t.Fatalf("stale version %d after ttl", v)
 	}
 
+	store.version = 5
+	c.Invalidate(1)
+	if v, _ := c.SessionVersion(context.Background(), 1); v != 5 {
+		t.Fatalf("version %d after Invalidate, want 5", v)
+	}
+
 	store.err = errors.New("db down")
 	if _, err := c.SessionVersion(context.Background(), 2); err == nil {
 		t.Fatal("error swallowed")

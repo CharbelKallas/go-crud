@@ -19,6 +19,7 @@ import (
 
 	"go-crud/auth"
 	"go-crud/handlers"
+	"go-crud/middlewares"
 	"go-crud/models"
 	"go-crud/repositories"
 	"go-crud/router"
@@ -177,6 +178,7 @@ func (f *fakeWeather) Current(_ context.Context, lat, lon float64) (models.Weath
 }
 
 type fakeRefresh struct {
+	onRevoke func(userID int64) // simulates the DB session-version bump
 	mu       sync.Mutex
 	grace    bool // retries of a just-used token return its child, like the DB grace window
 	tokens   map[string]*fakeRefreshRow
@@ -225,6 +227,9 @@ func (f *fakeRefresh) Rotate(_ context.Context, oldID string, userID int64, newI
 		if r.userID == userID {
 			r.revoked = true
 		}
+	}
+	if f.onRevoke != nil {
+		f.onRevoke(userID)
 	}
 	return repositories.Rotated{}, repositories.ErrTokenReused
 }
@@ -501,6 +506,34 @@ func TestRevokedSessionsRejectTokens(t *testing.T) {
 	var fresh handlers.LoginResponse
 	decode(t, rec, &fresh)
 	expect(t, h.do("GET", "/api/albums", fresh.Token, nil), http.StatusOK)
+}
+
+func TestRevocationBypassesLocalSessionCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	users := &fakeUsers{users: map[string]models.User{}}
+	refresh := newFakeRefresh()
+	refresh.onRevoke = func(id int64) {
+		for email, u := range users.users {
+			if u.ID == id {
+				users.revokeSessions(email)
+			}
+		}
+	}
+	tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", 15*time.Minute, time.Hour)
+	authHandler, _ := handlers.NewAuthHandler(users, refresh, tokens, bcrypt.MinCost)
+	sessions := middlewares.NewCachedSessions(users, time.Hour) // would hide the revocation for an hour
+	authHandler.OnSessionsRevoked(sessions.Invalidate)
+	h := &harness{t: t, tokens: tokens, users: users, refresh: refresh, engine: router.New(router.Deps{
+		Tokens: tokens, Auth: authHandler, Health: handlers.NewHealthCheck(fakePinger{}), Sessions: sessions,
+		Albums:  handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
+		Weather: handlers.NewWeatherHandler(nil),
+	})}
+
+	old := h.login()
+	expect(t, h.do("GET", "/api/albums", old.Token, nil), http.StatusOK) // caches version 0
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": old.RefreshToken}), http.StatusOK)
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": old.RefreshToken}), http.StatusUnauthorized) // reuse
+	expect(t, h.do("GET", "/api/albums", old.Token, nil), http.StatusUnauthorized)
 }
 
 func TestTokensBoundToAccountNotEmail(t *testing.T) {
