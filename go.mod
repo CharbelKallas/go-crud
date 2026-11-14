@@ -2,6 +2,9 @@ module go-crud
 
 go 1.26.10
 
+// Build with a patched toolchain (Go 1.26.10 has GO-2026-6859 in net/http).
+toolchain go1.27.4
+
 require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-playground/validator/v10 v10.30.6
