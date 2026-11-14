@@ -186,7 +186,7 @@ func TestEndToEnd(t *testing.T) {
 		Auth:     authHandler,
 		Albums:   handlers.NewAlbumHandler(repositories.NewAlbumRepository(testDB)),
 		Weather:  handlers.NewWeatherHandler(nil),
-		DB:       testDB,
+		Health:   handlers.NewHealthCheck(testDB),
 		Sessions: repositories.NewUserRepository(testDB),
 	}))
 	defer srv.Close()
@@ -268,7 +268,6 @@ func TestEndToEnd(t *testing.T) {
 
 	// A fresh login works again, and an old revoked token presented again
 	// does not log the user out a second time.
-	time.Sleep(5 * time.Millisecond)
 	var again handlers.LoginResponse
 	call("POST", "/api/auth/login", "", map[string]string{"email": "ann@example.com", "password": "correct horse"}, 200, &again)
 	call("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": refreshed.RefreshToken}, 401, nil)
@@ -321,9 +320,8 @@ func TestRefreshTokenRepository(t *testing.T) {
 				t.Fatalf("%s not revoked: %v", id, err)
 			}
 		}
-		var revokedAt sql.NullTime
-		if err := testDB.QueryRow("SELECT tokens_revoked_at FROM user WHERE id = ?", u.ID).Scan(&revokedAt); err != nil || !revokedAt.Valid {
-			t.Fatalf("tokens_revoked_at not set: %v %v", revokedAt, err)
+		if v, err := users.SessionVersion(ctx, u.ID); err != nil || v != 1 {
+			t.Fatalf("session version = %d, %v; want 1", v, err)
 		}
 		if _, err := repo.Rotate(ctx, "nope", u.ID, "y", future); !errors.Is(err, repositories.ErrNotFound) {
 			t.Fatalf("unknown: %v", err)
@@ -401,6 +399,29 @@ func TestRefreshTokenRepository(t *testing.T) {
 		}
 		if _, err := repo.Rotate(ctx, "x-live", u.ID, "x-live-next", future); err != nil {
 			t.Fatalf("sibling revoked by an expired token: %v", err)
+		}
+	})
+
+	t.Run("revocation survives a cancelled request", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 0)
+		for _, id := range []string{"c1", "c2"} {
+			if err := repo.Save(ctx, id, u.ID, future); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := repo.Rotate(ctx, "c1", u.ID, "c1-next", future); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := users.SessionVersion(ctx, u.ID)
+		// The client hangs up just as the reuse is detected.
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		_, err := repo.Rotate(cancelled, "c1", u.ID, "c1-again", future)
+		if !errors.Is(err, repositories.ErrTokenReused) {
+			t.Fatalf("err = %v", err)
+		}
+		if after, _ := users.SessionVersion(ctx, u.ID); after != before+1 {
+			t.Fatalf("session version %d -> %d: revocation skipped", before, after)
 		}
 	})
 

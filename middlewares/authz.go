@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -15,15 +14,16 @@ import (
 	"go-crud/repositories"
 )
 
-// SessionStore reports when a user's sessions were revoked (see
-// repositories.UserRepository.TokensRevokedAt).
+// SessionStore returns a user's current session version (see
+// repositories.UserRepository.SessionVersion), or repositories.ErrNotFound
+// for a deleted user.
 type SessionStore interface {
-	TokensRevokedAt(ctx context.Context, email string) (time.Time, error)
+	SessionVersion(ctx context.Context, userID int64) (int64, error)
 }
 
 // AuthHandler requires a valid access token in "Authorization: Bearer <token>".
 // Refresh tokens are rejected, as are access tokens of deleted users and
-// tokens issued before the user's sessions were revoked.
+// tokens whose session version is older than the user's (sessions revoked).
 func AuthHandler(tokens *auth.TokenManager, sessions SessionStore) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		scheme, token, found := strings.Cut(c.GetHeader("Authorization"), " ")
@@ -40,7 +40,7 @@ func AuthHandler(tokens *auth.TokenManager, sessions SessionStore) gin.HandlerFu
 			return
 		}
 
-		revokedAt, err := sessions.TokensRevokedAt(c.Request.Context(), claims.Email)
+		current, err := sessions.SessionVersion(c.Request.Context(), claims.UserID)
 		switch {
 		case errors.Is(err, repositories.ErrNotFound):
 			unauthorized(c, "invalid or expired token")
@@ -49,7 +49,7 @@ func AuthHandler(tokens *auth.TokenManager, sessions SessionStore) gin.HandlerFu
 			slog.ErrorContext(c.Request.Context(), "session check failed", "error", err)
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"message": "internal server error"})
 			return
-		case !revokedAt.IsZero() && (claims.IssuedAt == nil || !claims.IssuedAt.Time.After(revokedAt)):
+		case claims.SessionVersion < current:
 			slog.InfoContext(c.Request.Context(), "access token rejected: sessions revoked")
 			unauthorized(c, "invalid or expired token")
 			return

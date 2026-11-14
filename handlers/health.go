@@ -21,26 +21,19 @@ const (
 	healthPingTimeout = 2 * time.Second
 )
 
-// Health answers 200 when the database is reachable, 503 otherwise.
+// HealthCheck serves /healthz: 200 when the database is reachable, 503
+// otherwise.
 //
 // The database is pinged at most once per healthCacheTTL. Requests arriving
 // while a ping is running wait for that same ping instead of queueing their
-// own, and the ping runs on its own context, so a client that disconnects
-// cannot make the check fail.
-func Health(db Pinger) gin.HandlerFunc {
-	hc := &healthCheck{db: db}
-	return func(c *gin.Context) {
-		healthy, ok := hc.status(c.Request.Context())
-		if !ok || !healthy {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unavailable"})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	}
-}
-
-type healthCheck struct {
-	db Pinger
+// own, and the ping runs on the checker's own context, so a client that
+// disconnects cannot make the check fail. Close stops it before the
+// database is closed.
+type HealthCheck struct {
+	db     Pinger
+	base   context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	mu      sync.Mutex
 	checked time.Time
@@ -48,9 +41,30 @@ type healthCheck struct {
 	pending chan struct{} // closed when the running ping finishes; nil if none
 }
 
+func NewHealthCheck(db Pinger) *HealthCheck {
+	base, cancel := context.WithCancel(context.Background())
+	return &HealthCheck{db: db, base: base, cancel: cancel}
+}
+
+// Close cancels any running ping and waits for it to finish. Call it
+// before closing the database.
+func (h *HealthCheck) Close() {
+	h.cancel()
+	h.wg.Wait()
+}
+
+func (h *HealthCheck) Handle(c *gin.Context) {
+	healthy, ok := h.status(c.Request.Context())
+	if !ok || !healthy {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 // status returns the cached result, refreshing it when stale. ok is false
-// when ctx ended before a result was available.
-func (h *healthCheck) status(ctx context.Context) (healthy, ok bool) {
+// when ctx ended (or the checker was closed) before a result was available.
+func (h *HealthCheck) status(ctx context.Context) (healthy, ok bool) {
 	h.mu.Lock()
 	if time.Since(h.checked) < healthCacheTTL {
 		healthy = h.healthy
@@ -59,8 +73,13 @@ func (h *healthCheck) status(ctx context.Context) (healthy, ok bool) {
 	}
 	done := h.pending
 	if done == nil {
+		if h.base.Err() != nil { // closed
+			h.mu.Unlock()
+			return false, false
+		}
 		done = make(chan struct{})
 		h.pending = done
+		h.wg.Add(1)
 		go h.ping(done)
 	}
 	h.mu.Unlock()
@@ -75,11 +94,12 @@ func (h *healthCheck) status(ctx context.Context) (healthy, ok bool) {
 	return h.healthy, true
 }
 
-func (h *healthCheck) ping(done chan struct{}) {
-	ctx, cancel := context.WithTimeout(context.Background(), healthPingTimeout)
+func (h *HealthCheck) ping(done chan struct{}) {
+	defer h.wg.Done()
+	ctx, cancel := context.WithTimeout(h.base, healthPingTimeout)
 	err := h.db.PingContext(ctx)
 	cancel()
-	if err != nil {
+	if err != nil && h.base.Err() == nil { // not shutting down
 		slog.Error("health check: database unreachable", "error", err)
 	}
 

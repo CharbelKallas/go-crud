@@ -66,7 +66,14 @@ type Rotated struct {
 // ErrTokenReused.
 //
 // The transaction is retried when MySQL aborts it to break a deadlock.
+//
+// Rotate runs detached from ctx's cancellation (with its own timeout): a
+// client that disconnects mid-request must not be able to skip the
+// revocation of a stolen token. A completed rotation the client never
+// receives is covered by the grace window.
 func (r *RefreshTokenRepository) Rotate(ctx context.Context, oldID string, userID int64, newID string, newExpiresAt time.Time) (Rotated, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
 	var (
 		rotated Rotated
 		reused  bool
@@ -79,7 +86,8 @@ func (r *RefreshTokenRepository) Rotate(ctx context.Context, oldID string, userI
 		return Rotated{}, err
 	}
 	if reused {
-		// Outside the transaction, so its row locks are already released.
+		// Outside the rotation transaction, so its row locks are already
+		// released.
 		if err := r.RevokeAll(ctx, userID); err != nil {
 			return Rotated{}, err
 		}
@@ -157,21 +165,27 @@ func (r *RefreshTokenRepository) rotateTx(ctx context.Context, oldID string, use
 	return Rotated{}, true, nil
 }
 
-// RevokeAll ends every session of the user: it revokes all outstanding
-// refresh tokens and records the time on the user, so access tokens issued
-// before it are rejected too (see middlewares.AuthHandler).
+// RevokeAll ends every session of the user in one transaction: it
+// increments the user's session version, which invalidates every access
+// and refresh token issued so far (see middlewares.AuthHandler and the
+// refresh handler), and marks the outstanding refresh tokens revoked.
 func (r *RefreshTokenRepository) RevokeAll(ctx context.Context, userID int64) error {
-	// App clock, millisecond precision, matching the access tokens' iat.
-	now := time.Now().UTC().Truncate(time.Millisecond)
 	return retryOnDeadlock(func() error {
-		if _, err := r.db.ExecContext(ctx,
-			"UPDATE user SET tokens_revoked_at = ? WHERE id = ?", now, userID); err != nil {
+		tx, err := r.db.BeginTx(ctx, nil)
+		if err != nil {
 			return fmt.Errorf("revoke sessions: %w", err)
 		}
-		_, err := r.db.ExecContext(ctx,
-			"UPDATE refresh_token SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ? AND revoked_at IS NULL", userID)
-		if err != nil {
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE user SET session_version = session_version + 1 WHERE id = ?", userID); err != nil {
+			return fmt.Errorf("revoke sessions: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE refresh_token SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ? AND revoked_at IS NULL", userID); err != nil {
 			return fmt.Errorf("revoke refresh tokens: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("revoke sessions: %w", err)
 		}
 		return nil
 	})

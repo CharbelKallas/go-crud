@@ -18,9 +18,10 @@ type Deps struct {
 	Auth    *handlers.AuthHandler
 	Albums  *handlers.AlbumHandler
 	Weather *handlers.WeatherHandler
-	DB      handlers.Pinger
+	Health  *handlers.HealthCheck
 	// Sessions is checked on every authenticated request (deleted users,
-	// revoked sessions).
+	// revoked sessions); wrap it in middlewares.CachedSessions to limit
+	// database lookups.
 	Sessions middlewares.SessionStore
 	// AuthRateLimitPerMinute limits the /api/auth routes per client IP;
 	// 0 disables the limit (tests).
@@ -43,7 +44,7 @@ func New(d Deps) *gin.Engine {
 	r.GET("/", func(c *gin.Context) {
 		c.String(http.StatusOK, "Welcome To This Website")
 	})
-	r.GET("/healthz", handlers.Health(d.DB))
+	r.GET("/healthz", d.Health.Handle)
 
 	api := r.Group("/api")
 

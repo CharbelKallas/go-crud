@@ -14,6 +14,7 @@ import (
 	"go-crud/config"
 	"go-crud/database"
 	"go-crud/handlers"
+	"go-crud/middlewares"
 	"go-crud/repositories"
 	"go-crud/router"
 	"go-crud/weather"
@@ -23,6 +24,11 @@ import (
 //
 //	go-crud           serve the API
 //	go-crud migrate   apply database migrations and exit
+//
+// sessionCacheTTL bounds how long an authenticated request may use a cached
+// session version, i.e. how long a revocation takes to reach access tokens.
+const sessionCacheTTL = 5 * time.Second
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	run := serve
@@ -73,6 +79,10 @@ func serve() error {
 		return err
 	}
 	defer db.Close()
+	// Deferred after db.Close, so it runs first: no health ping outlives
+	// the database.
+	health := handlers.NewHealthCheck(db)
+	defer health.Close()
 	slog.Info("connected to database", "addr", cfg.DBAddr, "database", cfg.DBName)
 
 	if cfg.MigrateOnStart {
@@ -107,8 +117,8 @@ func serve() error {
 		Auth:     authHandler,
 		Albums:   handlers.NewAlbumHandler(repositories.NewAlbumRepository(db)),
 		Weather:  handlers.NewWeatherHandler(weatherProvider),
-		DB:       db,
-		Sessions: users,
+		Health:   health,
+		Sessions: middlewares.NewCachedSessions(users, sessionCacheTTL),
 
 		AuthRateLimitPerMinute: cfg.AuthRateLimitPerMinute,
 		TrustedProxies:         cfg.TrustedProxies,

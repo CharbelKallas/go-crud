@@ -11,17 +11,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
-
-func init() {
-	// Encode iat/exp/nbf with millisecond precision (RFC 7519 allows
-	// fractional NumericDates) so an access token can be compared exactly
-	// with a session revocation time.
-	jwt.TimePrecision = time.Millisecond
-}
 
 type TokenType string
 
@@ -35,9 +29,21 @@ const (
 // clients.
 var ErrInvalidToken = errors.New("invalid token")
 
+// Subject identifies whom a token is issued to.
+type Subject struct {
+	UserID int64
+	Email  string
+	// SessionVersion is the user's session version at issue time. Revoking
+	// a user's sessions increments it, which invalidates every token
+	// carrying an older version without comparing clocks.
+	SessionVersion int64
+}
+
 type Claims struct {
-	Email string    `json:"email"`
-	Type  TokenType `json:"typ"`
+	UserID         int64     `json:"uid"`
+	SessionVersion int64     `json:"sv"`
+	Email          string    `json:"email"`
+	Type           TokenType `json:"typ"`
 	jwt.RegisteredClaims
 }
 
@@ -67,14 +73,14 @@ type Issued struct {
 }
 
 // Generate signs a new token of the given type for the user.
-func (m *TokenManager) Generate(email string, typ TokenType) (string, error) {
-	issued, err := m.Issue(email, typ)
+func (m *TokenManager) Generate(sub Subject, typ TokenType) (string, error) {
+	issued, err := m.Issue(sub, typ)
 	return issued.Token, err
 }
 
 // Issue signs a new token of the given type and returns it with its unique
 // ID and expiry, so refresh tokens can be recorded server-side.
-func (m *TokenManager) Issue(email string, typ TokenType) (Issued, error) {
+func (m *TokenManager) Issue(sub Subject, typ TokenType) (Issued, error) {
 	idBytes := make([]byte, 16)
 	if _, err := rand.Read(idBytes); err != nil {
 		return Issued{}, fmt.Errorf("token id: %w", err)
@@ -83,23 +89,28 @@ func (m *TokenManager) Issue(email string, typ TokenType) (Issued, error) {
 	if err != nil {
 		return Issued{}, err
 	}
-	return m.IssueWithID(email, typ, hex.EncodeToString(idBytes), m.now().Add(ttl))
+	return m.IssueWithID(sub, typ, hex.EncodeToString(idBytes), m.now().Add(ttl))
 }
 
 // IssueWithID signs a token with a given ID and expiry. It re-issues an
 // already recorded refresh token (same ID, same expiry) when a client
 // retries a refresh.
-func (m *TokenManager) IssueWithID(email string, typ TokenType, id string, expiresAt time.Time) (Issued, error) {
+func (m *TokenManager) IssueWithID(sub Subject, typ TokenType, id string, expiresAt time.Time) (Issued, error) {
+	if sub.UserID <= 0 || sub.Email == "" {
+		return Issued{}, errors.New("token subject needs a user ID and an email")
+	}
 	if _, err := m.ttl(typ); err != nil {
 		return Issued{}, err
 	}
 	now := m.now()
 	claims := Claims{
-		Email: email,
-		Type:  typ,
+		UserID:         sub.UserID,
+		SessionVersion: sub.SessionVersion,
+		Email:          sub.Email,
+		Type:           typ,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        id,
-			Subject:   email,
+			Subject:   strconv.FormatInt(sub.UserID, 10),
 			Issuer:    m.issuer,
 			IssuedAt:  jwt.NewNumericDate(now),
 			NotBefore: jwt.NewNumericDate(now),
@@ -146,8 +157,8 @@ func (m *TokenManager) Validate(signed string, want TokenType) (*Claims, error) 
 	if claims.ID == "" {
 		return nil, fmt.Errorf("%w: missing jti", ErrInvalidToken)
 	}
-	if claims.Email == "" {
-		return nil, fmt.Errorf("%w: missing email", ErrInvalidToken)
+	if claims.UserID <= 0 || claims.Email == "" {
+		return nil, fmt.Errorf("%w: missing user", ErrInvalidToken)
 	}
 	return claims, nil
 }

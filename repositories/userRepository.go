@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -45,24 +44,24 @@ func (r *UserRepository) UpdatePasswordHash(ctx context.Context, id int64, hash 
 	return nil
 }
 
-// TokensRevokedAt returns when the user's sessions were last revoked (zero
-// if never), or ErrNotFound if the user no longer exists.
-func (r *UserRepository) TokensRevokedAt(ctx context.Context, email string) (time.Time, error) {
-	var revoked sql.NullTime
-	err := r.db.QueryRowContext(ctx, "SELECT tokens_revoked_at FROM user WHERE email = ?", email).Scan(&revoked)
+// SessionVersion returns the user's current session version, or
+// ErrNotFound if the user no longer exists.
+func (r *UserRepository) SessionVersion(ctx context.Context, userID int64) (int64, error) {
+	var v int64
+	err := r.db.QueryRowContext(ctx, "SELECT session_version FROM user WHERE id = ?", userID).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
-		return time.Time{}, ErrNotFound
+		return 0, ErrNotFound
 	}
 	if err != nil {
-		return time.Time{}, fmt.Errorf("tokens revoked at: %w", err)
+		return 0, fmt.Errorf("session version: %w", err)
 	}
-	return revoked.Time, nil
+	return v, nil
 }
 
 func (r *UserRepository) GetByEmail(ctx context.Context, email string) (models.User, error) {
 	var user models.User
-	err := r.db.QueryRowContext(ctx, "SELECT id, name, email, password FROM user WHERE email = ?", email).
-		Scan(&user.ID, &user.Name, &user.Email, &user.Password)
+	err := r.db.QueryRowContext(ctx, "SELECT id, name, email, password, session_version FROM user WHERE email = ?", email).
+		Scan(&user.ID, &user.Name, &user.Email, &user.Password, &user.SessionVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return user, ErrNotFound
 	}

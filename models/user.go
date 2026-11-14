@@ -11,6 +11,9 @@ type User struct {
 	Name     string
 	Email    string
 	Password string
+	// SessionVersion is incremented when all of the user's sessions are
+	// revoked; tokens carrying an older version are rejected.
+	SessionVersion int64
 }
 
 func (user *User) HashPassword(password string, cost int) error {

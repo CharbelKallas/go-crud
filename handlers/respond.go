@@ -58,7 +58,12 @@ func bindJSON(c *gin.Context, dst any) bool {
 	// The body must be exactly one JSON value (trailing whitespace is fine).
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); err != io.EOF {
-		respondError(c, http.StatusBadRequest, "invalid JSON body: unexpected data after the JSON object")
+		msg := "invalid JSON body: unexpected data after the JSON object"
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			msg = "request body too large"
+		}
+		respondError(c, http.StatusBadRequest, msg)
 		return false
 	}
 	if n, ok := dst.(normalizer); ok {

@@ -28,26 +28,34 @@ import (
 // --- fakes -----------------------------------------------------------------
 
 type fakeUsers struct {
-	mu      sync.Mutex
-	users   map[string]models.User
-	revoked map[string]time.Time
+	mu     sync.Mutex
+	users  map[string]models.User
+	nextID int64
 }
 
-func (f *fakeUsers) TokensRevokedAt(_ context.Context, email string) (time.Time, error) {
+func (f *fakeUsers) SessionVersion(_ context.Context, id int64) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.users[email]; !ok {
-		return time.Time{}, repositories.ErrNotFound
+	for _, u := range f.users {
+		if u.ID == id {
+			return u.SessionVersion, nil
+		}
 	}
-	return f.revoked[email], nil
+	return 0, repositories.ErrNotFound
+}
+
+func (f *fakeUsers) revokeSessions(email string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u := f.users[email]
+	u.SessionVersion++
+	f.users[email] = u
 }
 
 // allowSessions is a SessionStore for tests that are not about sessions.
-type allowSessions struct{}
+type allowSessions struct{ err error }
 
-func (allowSessions) TokensRevokedAt(context.Context, string) (time.Time, error) {
-	return time.Time{}, nil
-}
+func (s allowSessions) SessionVersion(context.Context, int64) (int64, error) { return 0, s.err }
 
 func (f *fakeUsers) Create(_ context.Context, u models.User) error {
 	f.mu.Lock()
@@ -55,7 +63,8 @@ func (f *fakeUsers) Create(_ context.Context, u models.User) error {
 	if _, ok := f.users[u.Email]; ok {
 		return repositories.ErrDuplicateEmail
 	}
-	u.ID = int64(len(f.users) + 1)
+	f.nextID++
+	u.ID = f.nextID
 	f.users[u.Email] = u
 	return nil
 }
@@ -272,7 +281,7 @@ func newHarness(t *testing.T) *harness {
 		Auth:     authHandler,
 		Albums:   handlers.NewAlbumHandler(h.albums),
 		Weather:  handlers.NewWeatherHandler(h.weather),
-		DB:       fakePinger{},
+		Health:   handlers.NewHealthCheck(fakePinger{}),
 		Sessions: h.users,
 	})
 	return h
@@ -357,11 +366,12 @@ func TestSignupLoginRefresh(t *testing.T) {
 	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": refreshed.RefreshToken}), http.StatusUnauthorized)
 
 	// A validly signed refresh token that was never issued is rejected.
-	unknown, _ := h.tokens.Generate("ann@example.com", auth.RefreshToken)
+	annUser := h.users.users["ann@example.com"]
+	unknown, _ := h.tokens.Generate(auth.Subject{UserID: annUser.ID, Email: annUser.Email}, auth.RefreshToken)
 	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": unknown}), http.StatusUnauthorized)
 
 	// A refresh token for a user that no longer exists is rejected.
-	ghost, _ := h.tokens.Generate("ghost@example.com", auth.RefreshToken)
+	ghost, _ := h.tokens.Generate(auth.Subject{UserID: 999, Email: "ghost@example.com"}, auth.RefreshToken)
 	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": ghost}), http.StatusUnauthorized)
 }
 
@@ -439,9 +449,10 @@ func TestAuthMiddleware(t *testing.T) {
 	h := newHarness(t)
 	tokens := h.login()
 	expired := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", -time.Minute, time.Hour)
-	expiredTok, _ := expired.Generate("ann@example.com", auth.AccessToken)
+	annSubject := auth.Subject{UserID: 1, Email: "ann@example.com"}
+	expiredTok, _ := expired.Generate(annSubject, auth.AccessToken)
 	forged := auth.NewTokenManager("undersecretary-undersecretary-undersecretary", "test", time.Hour, time.Hour)
-	forgedTok, _ := forged.Generate("ann@example.com", auth.AccessToken)
+	forgedTok, _ := forged.Generate(annSubject, auth.AccessToken)
 
 	for name, header := range map[string]string{
 		"missing":       "",
@@ -474,31 +485,59 @@ func TestAuthMiddleware(t *testing.T) {
 	expect(t, rec, http.StatusOK)
 }
 
-func TestRevokedSessionsRejectAccessTokens(t *testing.T) {
+func TestRevokedSessionsRejectTokens(t *testing.T) {
 	h := newHarness(t)
-	old := h.login().Token
-	expect(t, h.do("GET", "/api/albums", old, nil), http.StatusOK)
+	old := h.login()
+	expect(t, h.do("GET", "/api/albums", old.Token, nil), http.StatusOK)
 
 	// Theft detected: every token issued so far stops working...
-	time.Sleep(2 * time.Millisecond)
-	h.users.mu.Lock()
-	h.users.revoked = map[string]time.Time{"ann@example.com": time.Now().UTC().Truncate(time.Millisecond)}
-	h.users.mu.Unlock()
-	expect(t, h.do("GET", "/api/albums", old, nil), http.StatusUnauthorized)
+	h.users.revokeSessions("ann@example.com")
+	expect(t, h.do("GET", "/api/albums", old.Token, nil), http.StatusUnauthorized)
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": old.RefreshToken}), http.StatusUnauthorized)
 
-	// ...but logging in again works.
-	time.Sleep(2 * time.Millisecond)
+	// ...but logging in again works immediately (no clock involved).
 	rec := h.do("POST", "/api/auth/login", "", map[string]string{"email": "ann@example.com", "password": "correct horse"})
 	expect(t, rec, http.StatusOK)
 	var fresh handlers.LoginResponse
 	decode(t, rec, &fresh)
 	expect(t, h.do("GET", "/api/albums", fresh.Token, nil), http.StatusOK)
+}
 
-	// A deleted user's tokens stop working.
+func TestTokensBoundToAccountNotEmail(t *testing.T) {
+	h := newHarness(t)
+	old := h.login()
+
+	// The account is deleted and the email re-registered: a new account.
 	h.users.mu.Lock()
 	delete(h.users.users, "ann@example.com")
 	h.users.mu.Unlock()
-	expect(t, h.do("GET", "/api/albums", fresh.Token, nil), http.StatusUnauthorized)
+	expect(t, h.do("GET", "/api/albums", old.Token, nil), http.StatusUnauthorized)
+	expect(t, h.do("POST", "/api/auth/signup", "", map[string]string{"name": "Ann 2", "email": "ann@example.com", "password": "another password"}), http.StatusCreated)
+
+	expect(t, h.do("GET", "/api/albums", old.Token, nil), http.StatusUnauthorized)
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": old.RefreshToken}), http.StatusUnauthorized)
+}
+
+func TestSessionLookupFailureIsHidden(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", time.Minute, time.Hour)
+	authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, newFakeRefresh(), tokens, bcrypt.MinCost)
+	engine := router.New(router.Deps{
+		Tokens: tokens, Auth: authHandler, Health: handlers.NewHealthCheck(fakePinger{}),
+		Sessions: allowSessions{err: errors.New("dial tcp 10.0.0.5:3306: connection refused")},
+		Albums:   handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
+		Weather:  handlers.NewWeatherHandler(nil),
+	})
+	tok, _ := tokens.Generate(auth.Subject{UserID: 1, Email: "a@example.com"}, auth.AccessToken)
+	req := httptest.NewRequest("GET", "/api/albums", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	engine.ServeHTTP(rec, req)
+	// Fails closed, without leaking the cause.
+	expect(t, rec, http.StatusInternalServerError)
+	if strings.Contains(rec.Body.String(), "10.0.0.5") {
+		t.Fatalf("internal error leaked: %s", rec.Body)
+	}
 }
 
 func TestAlbumCRUD(t *testing.T) {
@@ -600,6 +639,7 @@ func TestJSONBodyErrors(t *testing.T) {
 		`{"title":"t","artist":"a","price":1}{"price":999}`: "invalid JSON body: unexpected data after the JSON object",
 		`{"title":"t","artist":"a","price":1} trailing`:     "invalid JSON body: unexpected data after the JSON object",
 		`{"title":"t",`: "invalid JSON body",
+		`{"title":"t","artist":"a","price":1}` + strings.Repeat(" ", 2<<20) + "x": "request body too large",
 	} {
 		rec := h.do("POST", "/api/albums", tok, body)
 		expect(t, rec, http.StatusBadRequest)
@@ -649,11 +689,11 @@ func TestWeatherNotConfigured(t *testing.T) {
 	tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", time.Minute, time.Hour)
 	authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, newFakeRefresh(), tokens, bcrypt.MinCost)
 	engine := router.New(router.Deps{
-		Tokens: tokens, Auth: authHandler, DB: fakePinger{}, Sessions: allowSessions{},
+		Tokens: tokens, Auth: authHandler, Health: handlers.NewHealthCheck(fakePinger{}), Sessions: allowSessions{},
 		Albums:  handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
 		Weather: handlers.NewWeatherHandler(nil),
 	})
-	tok, _ := tokens.Generate("a@example.com", auth.AccessToken)
+	tok, _ := tokens.Generate(auth.Subject{UserID: 1, Email: "a@example.com"}, auth.AccessToken)
 	req := httptest.NewRequest("GET", "/api/weather/1/2", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	rec := httptest.NewRecorder()
@@ -666,7 +706,7 @@ func TestAuthRoutesAreRateLimited(t *testing.T) {
 	tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", time.Minute, time.Hour)
 	authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, newFakeRefresh(), tokens, bcrypt.MinCost)
 	engine := router.New(router.Deps{
-		Tokens: tokens, Auth: authHandler, DB: fakePinger{}, Sessions: allowSessions{},
+		Tokens: tokens, Auth: authHandler, Health: handlers.NewHealthCheck(fakePinger{}), Sessions: allowSessions{},
 		Albums:                 handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
 		Weather:                handlers.NewWeatherHandler(nil),
 		AuthRateLimitPerMinute: 2,
@@ -729,7 +769,7 @@ func TestRateLimitUsesTrustedProxyHeader(t *testing.T) {
 		tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", time.Minute, time.Hour)
 		authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, newFakeRefresh(), tokens, bcrypt.MinCost)
 		return router.New(router.Deps{
-			Tokens: tokens, Auth: authHandler, DB: fakePinger{}, Sessions: allowSessions{},
+			Tokens: tokens, Auth: authHandler, Health: handlers.NewHealthCheck(fakePinger{}), Sessions: allowSessions{},
 			Albums:                 handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
 			Weather:                handlers.NewWeatherHandler(nil),
 			AuthRateLimitPerMinute: 1,
@@ -762,7 +802,7 @@ func TestHealthCachesDatabaseCheck(t *testing.T) {
 	var calls atomic.Int32
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/healthz", handlers.Health(fakePinger{calls: &calls}))
+	r.GET("/healthz", handlers.NewHealthCheck(fakePinger{calls: &calls}).Handle)
 	for i := 0; i < 5; i++ {
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
@@ -778,7 +818,7 @@ func TestHealthConcurrentRequestsShareOnePing(t *testing.T) {
 	release := make(chan struct{})
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/healthz", handlers.Health(fakePinger{calls: &calls, release: release}))
+	r.GET("/healthz", handlers.NewHealthCheck(fakePinger{calls: &calls, release: release}).Handle)
 
 	var wg sync.WaitGroup
 	codes := make([]int, 10)
@@ -808,7 +848,7 @@ func TestHealthIgnoresCancelledClient(t *testing.T) {
 	release := make(chan struct{})
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/healthz", handlers.Health(fakePinger{release: release}))
+	r.GET("/healthz", handlers.NewHealthCheck(fakePinger{release: release}).Handle)
 
 	// The first client gives up while the ping is still running...
 	ctx, cancel := context.WithCancel(context.Background())
@@ -823,6 +863,31 @@ func TestHealthIgnoresCancelledClient(t *testing.T) {
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	expect(t, rec, http.StatusOK)
+}
+
+func TestHealthCloseStopsRunningPing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hc := handlers.NewHealthCheck(fakePinger{release: make(chan struct{})}) // never released
+	r := gin.New()
+	r.GET("/healthz", hc.Handle)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil).WithContext(ctx)) // starts a ping that hangs
+	expect(t, rec, http.StatusServiceUnavailable)
+
+	closed := make(chan struct{})
+	go func() { hc.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not stop the running ping")
+	}
+	// After Close no new ping starts.
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	expect(t, rec, http.StatusServiceUnavailable)
 }
 
 func TestHealth(t *testing.T) {

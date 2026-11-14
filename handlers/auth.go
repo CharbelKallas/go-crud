@@ -160,7 +160,8 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		respondError(c, http.StatusUnauthorized, "invalid refresh token")
 		return
 	}
-	// Make sure the account still exists before issuing new tokens.
+	// The account must still exist, be the same account (not a new one
+	// re-registered with the email), and not have had its sessions revoked.
 	user, err := h.users.GetByEmail(c.Request.Context(), claims.Email)
 	if errors.Is(err, repositories.ErrNotFound) {
 		respondError(c, http.StatusUnauthorized, "invalid refresh token")
@@ -168,6 +169,10 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	}
 	if err != nil {
 		respondInternal(c, err)
+		return
+	}
+	if user.ID != claims.UserID || claims.SessionVersion < user.SessionVersion {
+		respondError(c, http.StatusUnauthorized, "invalid refresh token")
 		return
 	}
 
@@ -191,7 +196,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	}
 	if rotated.ID != refresh.ID {
 		// A retry: re-sign the refresh token that was already issued.
-		if refresh, err = h.tokens.IssueWithID(user.Email, auth.RefreshToken, rotated.ID, rotated.ExpiresAt); err != nil {
+		if refresh, err = h.tokens.IssueWithID(subjectOf(user), auth.RefreshToken, rotated.ID, rotated.ExpiresAt); err != nil {
 			respondInternal(c, err)
 			return
 		}
@@ -219,13 +224,17 @@ func (h *AuthHandler) upgradeHash(ctx context.Context, user models.User, passwor
 // newTokenPair signs an access token and a refresh token for the user. It
 // stores nothing.
 func (h *AuthHandler) newTokenPair(user models.User) (string, auth.Issued, error) {
-	access, err := h.tokens.Generate(user.Email, auth.AccessToken)
+	access, err := h.tokens.Generate(subjectOf(user), auth.AccessToken)
 	if err != nil {
 		return "", auth.Issued{}, err
 	}
-	refresh, err := h.tokens.Issue(user.Email, auth.RefreshToken)
+	refresh, err := h.tokens.Issue(subjectOf(user), auth.RefreshToken)
 	if err != nil {
 		return "", auth.Issued{}, err
 	}
 	return access, refresh, nil
+}
+
+func subjectOf(user models.User) auth.Subject {
+	return auth.Subject{UserID: user.ID, Email: user.Email, SessionVersion: user.SessionVersion}
 }
