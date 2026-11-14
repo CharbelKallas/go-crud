@@ -30,7 +30,7 @@ type UserStore interface {
 // repositories.RefreshTokenRepository).
 type RefreshTokenStore interface {
 	Save(ctx context.Context, id string, userID int64, expiresAt time.Time) error
-	Consume(ctx context.Context, id string, userID int64) error
+	Rotate(ctx context.Context, oldID string, userID int64, newID string, newExpiresAt time.Time) error
 }
 
 type AuthHandler struct {
@@ -130,12 +130,24 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 	h.upgradeHash(c.Request.Context(), user, p.Password)
-	h.issueTokens(c, user)
+
+	access, refresh, err := h.newTokenPair(user)
+	if err != nil {
+		respondInternal(c, err)
+		return
+	}
+	if err := h.refresh.Save(c.Request.Context(), refresh.ID, user.ID, refresh.ExpiresAt); err != nil {
+		respondInternal(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, LoginResponse{Token: access, RefreshToken: refresh.Token})
 }
 
 // Refresh exchanges a valid refresh token for a new access/refresh pair.
-// Each refresh token works once; presenting a used one revokes all of the
-// user's refresh tokens (the token was probably stolen).
+// Each refresh token works once (plus a short grace window for retries);
+// presenting a used one again revokes all of the user's refresh tokens, as
+// the token was probably stolen. The old token is only consumed if the new
+// one is stored, so a failed refresh can be retried.
 func (h *AuthHandler) Refresh(c *gin.Context) {
 	var p RefreshPayload
 	if !bindJSON(c, &p) {
@@ -158,7 +170,12 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		return
 	}
 
-	switch err := h.refresh.Consume(c.Request.Context(), claims.ID, user.ID); {
+	access, refresh, err := h.newTokenPair(user)
+	if err != nil {
+		respondInternal(c, err)
+		return
+	}
+	switch err := h.refresh.Rotate(c.Request.Context(), claims.ID, user.ID, refresh.ID, refresh.ExpiresAt); {
 	case errors.Is(err, repositories.ErrTokenReused):
 		slog.WarnContext(c.Request.Context(), "refresh token reused; revoked all refresh tokens of the user", "user_id", user.ID)
 		respondError(c, http.StatusUnauthorized, "invalid refresh token")
@@ -170,7 +187,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		respondInternal(c, err)
 		return
 	}
-	h.issueTokens(c, user)
+	c.JSON(http.StatusOK, LoginResponse{Token: access, RefreshToken: refresh.Token})
 }
 
 // upgradeHash re-hashes the password when it was stored with a different
@@ -190,20 +207,16 @@ func (h *AuthHandler) upgradeHash(ctx context.Context, user models.User, passwor
 	}
 }
 
-func (h *AuthHandler) issueTokens(c *gin.Context, user models.User) {
+// newTokenPair signs an access token and a refresh token for the user. It
+// stores nothing.
+func (h *AuthHandler) newTokenPair(user models.User) (string, auth.Issued, error) {
 	access, err := h.tokens.Generate(user.Email, auth.AccessToken)
 	if err != nil {
-		respondInternal(c, err)
-		return
+		return "", auth.Issued{}, err
 	}
 	refresh, err := h.tokens.Issue(user.Email, auth.RefreshToken)
 	if err != nil {
-		respondInternal(c, err)
-		return
+		return "", auth.Issued{}, err
 	}
-	if err := h.refresh.Save(c.Request.Context(), refresh.ID, user.ID, refresh.ExpiresAt); err != nil {
-		respondInternal(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, LoginResponse{Token: access, RefreshToken: refresh.Token})
+	return access, refresh, nil
 }

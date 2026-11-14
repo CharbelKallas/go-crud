@@ -13,7 +13,7 @@ cp .env.example .env    # then fill in the empty secrets in .env
 docker compose up --build
 ```
 
-The API listens on http://localhost:8080. MySQL is published on `127.0.0.1:3307` for local tools. Database migrations are applied automatically at startup (`MIGRATE_ON_START=true`).
+The API listens on http://localhost:8080. MySQL is published on `127.0.0.1:3307` for local tools. A one-shot `migrate` service applies database migrations before the API starts; if it fails, `docker compose up` stops and `docker compose logs migrate` shows why. Outside Compose, the API applies migrations at startup (`MIGRATE_ON_START=true`), or run `go-crud migrate`.
 
 ## Run locally
 
@@ -39,6 +39,8 @@ All configuration comes from environment variables. The app refuses to start if 
 | `ACCESS_TOKEN_TTL` / `REFRESH_TOKEN_TTL` | | `15m` / `12h` | Go durations |
 | `BCRYPT_COST` | | `12` | 10–31 |
 | `AUTH_RATE_LIMIT_PER_MINUTE` | | `10` | Requests per client IP per minute to `/api/auth/*`; over the limit answers 429 |
+| `TRUSTED_PROXIES` | | | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-For` is trusted. **Set it behind a reverse proxy or load balancer**, or all clients share the proxy's rate limit |
+| `REFRESH_REUSE_GRACE` | | `10s` | How long a just-used refresh token may be retried (lost response); `0s` = strictly single-use |
 | `HTTP_ADDR` | | `:8080` | |
 | `MIGRATE_ON_START` | | `true` | |
 | `WEATHER_API_KEY` | | | Without it `/api/weather` answers 503 |
@@ -47,9 +49,9 @@ All configuration comes from environment variables. The app refuses to start if 
 
 ## API
 
-Protected routes need `Authorization: Bearer <Token>` using the **access** token from login. The refresh token is only accepted by `/api/auth/refresh`, and **each refresh token works once**: always store the new pair it returns. Presenting a refresh token a second time is treated as theft and revokes all of that user's refresh tokens, so the user must log in again (clients must not refresh concurrently with the same token).
+Protected routes need `Authorization: Bearer <Token>` using the **access** token from login. The refresh token is only accepted by `/api/auth/refresh`, and **each refresh token works once**: always store the new pair it returns. Presenting a refresh token again after `REFRESH_REUSE_GRACE` (default 10 s, for retries after a lost response) is treated as theft and revokes all of that user's refresh tokens, so the user must log in again. A failed refresh (5xx) does not consume the token and can be retried.
 
-`/api/auth/*` is rate-limited per client IP (`AUTH_RATE_LIMIT_PER_MINUTE`, 429 with `Retry-After` when exceeded). The limit is kept in memory per app instance.
+`/api/auth/*` is rate-limited per client IP (`AUTH_RATE_LIMIT_PER_MINUTE`, 429 with `Retry-After` when exceeded). The limit is kept in memory per app instance. Behind a reverse proxy set `TRUSTED_PROXIES`; with Docker Desktop port forwarding, all local requests appear to come from the Docker gateway.
 
 | Method | Path | Success | Errors |
 |---|---|---|---|
@@ -93,4 +95,4 @@ SQL migrations live in [`migrations/`](migrations) ([golang-migrate](https://git
 SELECT email, COUNT(*) FROM user GROUP BY email HAVING COUNT(*) > 1;
 ```
 
-Remove the duplicates, then mark the failed migration as not applied and restart: `migrate -path migrations -database "mysql://USER:PASS@tcp(HOST:PORT)/recordings" force 1481574547`.
+Remove the duplicates, then mark the failed migration as not applied and run `docker compose up` again: `migrate -path migrations -database "mysql://USER:PASS@tcp(HOST:PORT)/recordings" force 1481574547`.

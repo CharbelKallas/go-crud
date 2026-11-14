@@ -6,8 +6,10 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -35,6 +37,14 @@ type Config struct {
 	// AuthRateLimitPerMinute is how many login/signup/refresh requests
 	// one client IP may make per minute.
 	AuthRateLimitPerMinute int
+	// RefreshReuseGrace lets a just-used refresh token be presented again
+	// for this long (client retries); 0 makes refresh tokens strictly
+	// single-use.
+	RefreshReuseGrace time.Duration
+	// TrustedProxies lists the reverse proxies (IPs or CIDRs) whose
+	// X-Forwarded-For / X-Real-IP headers are believed when determining
+	// the client IP. Empty means none: the TCP peer is the client.
+	TrustedProxies []string
 
 	// WeatherAPIKey is the weatherapi.com key. When empty the weather
 	// endpoint answers 503 instead of failing the whole app.
@@ -82,6 +92,23 @@ func Load() (Config, error) {
 	if cfg.AuthRateLimitPerMinute, err = strconv.Atoi(getenv("AUTH_RATE_LIMIT_PER_MINUTE", "10")); err != nil ||
 		cfg.AuthRateLimitPerMinute < 1 || cfg.AuthRateLimitPerMinute > 10_000 {
 		errs = append(errs, errors.New("AUTH_RATE_LIMIT_PER_MINUTE must be an integer between 1 and 10000"))
+	}
+
+	if cfg.RefreshReuseGrace, err = time.ParseDuration(getenv("REFRESH_REUSE_GRACE", "10s")); err != nil ||
+		cfg.RefreshReuseGrace < 0 || cfg.RefreshReuseGrace > time.Minute {
+		errs = append(errs, errors.New("REFRESH_REUSE_GRACE must be a duration between 0s and 1m"))
+	}
+	for _, p := range strings.Split(os.Getenv("TRUSTED_PROXIES"), ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		if net.ParseIP(p) == nil {
+			if _, _, err := net.ParseCIDR(p); err != nil {
+				errs = append(errs, fmt.Errorf("TRUSTED_PROXIES: %q is not an IP address or CIDR", p))
+				continue
+			}
+		}
+		cfg.TrustedProxies = append(cfg.TrustedProxies, p)
 	}
 
 	if cfg.DBUser == "" {

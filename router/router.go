@@ -22,14 +22,20 @@ type Deps struct {
 	// AuthRateLimitPerMinute limits the /api/auth routes per client IP;
 	// 0 disables the limit (tests).
 	AuthRateLimitPerMinute int
+	// TrustedProxies are the reverse proxies whose forwarding headers are
+	// believed for the client IP (used by the rate limiter and logs).
+	TrustedProxies []string
 }
 
 func New(d Deps) *gin.Engine {
 	r := gin.New()
 	r.Use(middlewares.RequestLogger(), gin.Recovery(), middlewares.MaxBodySize(maxBodyBytes))
-	// The app is not deployed behind a trusted proxy; do not believe
-	// X-Forwarded-For.
-	_ = r.SetTrustedProxies(nil)
+	// Only believe X-Forwarded-For / X-Real-IP from configured proxies;
+	// with none, the TCP peer address is the client IP. Entries are
+	// validated by config.Load.
+	if err := r.SetTrustedProxies(d.TrustedProxies); err != nil {
+		panic(err)
+	}
 
 	r.GET("/", func(c *gin.Context) {
 		c.String(http.StatusOK, "Welcome To This Website")

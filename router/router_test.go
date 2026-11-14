@@ -150,8 +150,10 @@ func (f *fakeWeather) Current(_ context.Context, lat, lon float64) (models.Weath
 }
 
 type fakeRefresh struct {
-	mu     sync.Mutex
-	tokens map[string]*fakeRefreshRow
+	mu       sync.Mutex
+	grace    bool // allow one immediate re-use, like the DB grace window
+	tokens   map[string]*fakeRefreshRow
+	failSave error
 }
 
 type fakeRefreshRow struct {
@@ -168,14 +170,14 @@ func (f *fakeRefresh) Save(_ context.Context, id string, userID int64, _ time.Ti
 	return nil
 }
 
-func (f *fakeRefresh) Consume(_ context.Context, id string, userID int64) error {
+func (f *fakeRefresh) Rotate(_ context.Context, oldID string, userID int64, newID string, _ time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	row, ok := f.tokens[id]
+	row, ok := f.tokens[oldID]
 	if !ok || row.userID != userID {
 		return repositories.ErrNotFound
 	}
-	if row.used || row.revoked {
+	if row.revoked || (row.used && !f.grace) {
 		for _, r := range f.tokens {
 			if r.userID == userID {
 				r.revoked = true
@@ -183,13 +185,25 @@ func (f *fakeRefresh) Consume(_ context.Context, id string, userID int64) error 
 		}
 		return repositories.ErrTokenReused
 	}
+	if f.failSave != nil {
+		return f.failSave // transaction rolled back: old token untouched
+	}
 	row.used = true
+	f.tokens[newID] = &fakeRefreshRow{userID: userID}
 	return nil
 }
 
-type fakePinger struct{ err error }
+type fakePinger struct {
+	err   error
+	calls *int
+}
 
-func (f fakePinger) PingContext(context.Context) error { return f.err }
+func (f fakePinger) PingContext(context.Context) error {
+	if f.calls != nil {
+		*f.calls++
+	}
+	return f.err
+}
 
 // --- harness ---------------------------------------------------------------
 
@@ -580,6 +594,74 @@ func TestAuthRoutesAreRateLimited(t *testing.T) {
 	}
 	if codes[0] != http.StatusUnauthorized || codes[1] != http.StatusUnauthorized || codes[2] != http.StatusTooManyRequests {
 		t.Fatalf("codes = %v", codes)
+	}
+}
+
+func TestFailedRefreshCanBeRetried(t *testing.T) {
+	h := newHarness(t)
+	tokens := h.login()
+	h.refresh.failSave = errors.New("db down")
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": tokens.RefreshToken}), http.StatusInternalServerError)
+	h.refresh.failSave = nil
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": tokens.RefreshToken}), http.StatusOK)
+}
+
+func TestRefreshRetryWithinGrace(t *testing.T) {
+	h := newHarness(t)
+	h.refresh.grace = true
+	tokens := h.login()
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": tokens.RefreshToken}), http.StatusOK)
+	// The response was "lost": the client retries with the same token.
+	expect(t, h.do("POST", "/api/auth/refresh", "", map[string]string{"RefreshToken": tokens.RefreshToken}), http.StatusOK)
+}
+
+func TestRateLimitUsesTrustedProxyHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	newEngine := func(proxies []string) *gin.Engine {
+		tokens := auth.NewTokenManager("test-secret-that-is-at-least-32-bytes-long", "test", time.Minute, time.Hour)
+		authHandler, _ := handlers.NewAuthHandler(&fakeUsers{users: map[string]models.User{}}, newFakeRefresh(), tokens, bcrypt.MinCost)
+		return router.New(router.Deps{
+			Tokens: tokens, Auth: authHandler, DB: fakePinger{},
+			Albums:                 handlers.NewAlbumHandler(&fakeAlbums{albums: map[int64]models.Album{}}),
+			Weather:                handlers.NewWeatherHandler(nil),
+			AuthRateLimitPerMinute: 1,
+			TrustedProxies:         proxies,
+		})
+	}
+	// Two different clients behind the same proxy (httptest's peer is 192.0.2.1).
+	codes := func(engine *gin.Engine) []int {
+		var out []int
+		for _, client := range []string{"203.0.113.10", "203.0.113.20"} {
+			req := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"email":"a@example.com","password":"x"}`))
+			req.Header.Set("X-Forwarded-For", client)
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, req)
+			out = append(out, rec.Code)
+		}
+		return out
+	}
+	if got := codes(newEngine([]string{"192.0.2.1"})); got[1] != http.StatusUnauthorized {
+		t.Errorf("trusted proxy: second client was limited: %v", got)
+	}
+	// Untrusted: the header is ignored, both requests share the peer's bucket
+	// (and a client cannot dodge the limit by forging the header).
+	if got := codes(newEngine(nil)); got[1] != http.StatusTooManyRequests {
+		t.Errorf("untrusted proxy: forged header bypassed the limit: %v", got)
+	}
+}
+
+func TestHealthCachesDatabaseCheck(t *testing.T) {
+	calls := 0
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/healthz", handlers.Health(fakePinger{calls: &calls}))
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+		expect(t, rec, http.StatusOK)
+	}
+	if calls != 1 {
+		t.Fatalf("database pinged %d times, want 1", calls)
 	}
 }
 

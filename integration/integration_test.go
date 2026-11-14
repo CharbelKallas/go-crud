@@ -156,7 +156,7 @@ func TestEndToEnd(t *testing.T) {
 	reset(t)
 	gin.SetMode(gin.TestMode)
 	tokens := auth.NewTokenManager(testCfg.JWTSecret, testCfg.JWTIssuer, time.Minute, time.Hour)
-	authHandler, err := handlers.NewAuthHandler(repositories.NewUserRepository(testDB), repositories.NewRefreshTokenRepository(testDB), tokens, bcrypt.DefaultCost)
+	authHandler, err := handlers.NewAuthHandler(repositories.NewUserRepository(testDB), repositories.NewRefreshTokenRepository(testDB, 0), tokens, bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,55 +251,107 @@ func TestRefreshTokenRepository(t *testing.T) {
 	reset(t)
 	ctx := context.Background()
 	users := repositories.NewUserRepository(testDB)
-	repo := repositories.NewRefreshTokenRepository(testDB)
 	if err := users.Create(ctx, models.User{Name: "A", Email: "a@example.com", Password: "h"}); err != nil {
 		t.Fatal(err)
 	}
 	u, _ := users.GetByEmail(ctx, "a@example.com")
-
 	future := time.Now().Add(time.Hour)
-	for _, id := range []string{"t1", "t2"} {
-		if err := repo.Save(ctx, id, u.ID, future); err != nil {
+	count := func(where string) int {
+		t.Helper()
+		var n int
+		if err := testDB.QueryRow("SELECT COUNT(*) FROM refresh_token WHERE " + where).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := repo.Consume(ctx, "t1", u.ID+1); !errors.Is(err, repositories.ErrNotFound) {
-		t.Fatalf("other user's token: %v", err)
-	}
-	if err := repo.Consume(ctx, "t1", u.ID); err != nil {
-		t.Fatalf("first use: %v", err)
-	}
-	if err := repo.Consume(ctx, "t1", u.ID); !errors.Is(err, repositories.ErrTokenReused) {
-		t.Fatalf("second use: %v", err)
-	}
-	if err := repo.Consume(ctx, "t2", u.ID); !errors.Is(err, repositories.ErrTokenReused) {
-		t.Fatalf("sibling not revoked: %v", err)
-	}
-	if err := repo.Consume(ctx, "nope", u.ID); !errors.Is(err, repositories.ErrNotFound) {
-		t.Fatalf("unknown: %v", err)
+		return n
 	}
 
-	// Expired rows are pruned on the next save.
-	if err := repo.Save(ctx, "old", u.ID, time.Now().Add(-time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.Save(ctx, "t3", u.ID, future); err != nil {
-		t.Fatal(err)
-	}
-	var n int
-	testDB.QueryRow("SELECT COUNT(*) FROM refresh_token WHERE jti = 'old'").Scan(&n)
-	if n != 0 {
-		t.Fatal("expired token not pruned")
-	}
+	t.Run("strict single use and family revocation", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 0)
+		for _, id := range []string{"s1", "s2"} {
+			if err := repo.Save(ctx, id, u.ID, future); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := repo.Rotate(ctx, "s1", u.ID+1, "x", future); !errors.Is(err, repositories.ErrNotFound) {
+			t.Fatalf("other user's token: %v", err)
+		}
+		if err := repo.Rotate(ctx, "s1", u.ID, "s1-next", future); err != nil {
+			t.Fatalf("first use: %v", err)
+		}
+		if count("jti = 's1-next'") != 1 {
+			t.Fatal("new token not stored")
+		}
+		if err := repo.Rotate(ctx, "s1", u.ID, "s1-again", future); !errors.Is(err, repositories.ErrTokenReused) {
+			t.Fatalf("second use: %v", err)
+		}
+		if count("jti = 's1-again'") != 0 {
+			t.Fatal("token stored for a rejected rotation")
+		}
+		for _, id := range []string{"s2", "s1-next"} {
+			if err := repo.Rotate(ctx, id, u.ID, id+"-x", future); !errors.Is(err, repositories.ErrTokenReused) {
+				t.Fatalf("%s not revoked: %v", id, err)
+			}
+		}
+		if err := repo.Rotate(ctx, "nope", u.ID, "y", future); !errors.Is(err, repositories.ErrNotFound) {
+			t.Fatalf("unknown: %v", err)
+		}
+	})
 
-	// Deleting the user deletes their tokens.
-	if _, err := testDB.Exec("DELETE FROM user WHERE id = ?", u.ID); err != nil {
-		t.Fatal(err)
-	}
-	testDB.QueryRow("SELECT COUNT(*) FROM refresh_token").Scan(&n)
-	if n != 0 {
-		t.Fatalf("%d tokens left after user deletion", n)
-	}
+	t.Run("failed insert rolls back the consume", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 0)
+		if err := repo.Save(ctx, "r1", u.ID, future); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Save(ctx, "taken", u.ID, future); err != nil {
+			t.Fatal(err)
+		}
+		// Duplicate new ID makes the INSERT fail inside the transaction.
+		if err := repo.Rotate(ctx, "r1", u.ID, "taken", future); err == nil {
+			t.Fatal("expected an error")
+		}
+		if err := repo.Rotate(ctx, "r1", u.ID, "r1-next", future); err != nil {
+			t.Fatalf("token burned by a failed rotation: %v", err)
+		}
+	})
+
+	t.Run("grace window allows a retry", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 10*time.Second)
+		if err := repo.Save(ctx, "g1", u.ID, future); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Rotate(ctx, "g1", u.ID, "g1-a", future); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Rotate(ctx, "g1", u.ID, "g1-b", future); err != nil {
+			t.Fatalf("retry within grace: %v", err)
+		}
+		// Outside the window it is theft again.
+		if _, err := testDB.Exec("UPDATE refresh_token SET used_at = UTC_TIMESTAMP() - INTERVAL 1 MINUTE WHERE jti = 'g1'"); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Rotate(ctx, "g1", u.ID, "g1-c", future); !errors.Is(err, repositories.ErrTokenReused) {
+			t.Fatalf("retry after grace: %v", err)
+		}
+	})
+
+	t.Run("prune and cascade", func(t *testing.T) {
+		repo := repositories.NewRefreshTokenRepository(testDB, 0)
+		if err := repo.Save(ctx, "old", u.ID, time.Now().Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Prune(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if count("jti = 'old'") != 0 {
+			t.Fatal("expired token not pruned")
+		}
+		if _, err := testDB.Exec("DELETE FROM user WHERE id = ?", u.ID); err != nil {
+			t.Fatal(err)
+		}
+		if n := count("1=1"); n != 0 {
+			t.Fatalf("%d tokens left after user deletion", n)
+		}
+	})
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }

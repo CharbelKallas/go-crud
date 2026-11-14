@@ -19,15 +19,49 @@ import (
 	"go-crud/weather"
 )
 
+// Usage:
+//
+//	go-crud           serve the API
+//	go-crud migrate   apply database migrations and exit
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	run := serve
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "migrate":
+			run = migrate
+		default:
+			slog.Error("unknown command", "command", os.Args[1])
+			os.Exit(2)
+		}
+	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+// migrate applies pending migrations and exits. docker-compose runs it as a
+// one-shot service before the API starts, so a failed migration stops the
+// stack with a clear error instead of crash-looping the API.
+func migrate() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	connectCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	db, err := database.Open(connectCtx, cfg)
+	cancel()
+	if err != nil {
+		return err
+	}
+	db.Close()
+	return database.Migrate(cfg)
+}
+
+func serve() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -52,7 +86,7 @@ func run() error {
 	}
 
 	tokens := auth.NewTokenManager(cfg.JWTSecret, cfg.JWTIssuer, cfg.AccessTokenTTL, cfg.RefreshTokenTTL)
-	authHandler, err := handlers.NewAuthHandler(repositories.NewUserRepository(db), repositories.NewRefreshTokenRepository(db), tokens, cfg.BcryptCost)
+	authHandler, err := handlers.NewAuthHandler(repositories.NewUserRepository(db), repositories.NewRefreshTokenRepository(db, cfg.RefreshReuseGrace), tokens, cfg.BcryptCost)
 	if err != nil {
 		return err
 	}
@@ -76,6 +110,7 @@ func run() error {
 		DB:      db,
 
 		AuthRateLimitPerMinute: cfg.AuthRateLimitPerMinute,
+		TrustedProxies:         cfg.TrustedProxies,
 	})
 
 	srv := &http.Server{
