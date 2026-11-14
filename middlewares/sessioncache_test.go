@@ -3,6 +3,7 @@ package middlewares
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -54,5 +55,53 @@ func TestCachedSessions(t *testing.T) {
 	c.SessionVersion(context.Background(), 2)
 	if store.calls != calls+1 {
 		t.Fatal("an error was cached")
+	}
+}
+
+// blockingStore returns version, but the first call waits until released.
+type blockingStore struct {
+	mu      sync.Mutex
+	version int64
+	calls   int
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingStore) SessionVersion(context.Context, int64) (int64, error) {
+	s.mu.Lock()
+	s.calls++
+	first := s.calls == 1
+	v := s.version // read "from the database" before blocking
+	s.mu.Unlock()
+	if first {
+		close(s.started)
+		<-s.release
+	}
+	return v, nil
+}
+
+func TestCachedSessionsInvalidateWinsRace(t *testing.T) {
+	store := &blockingStore{version: 0, started: make(chan struct{}), release: make(chan struct{})}
+	c := NewCachedSessions(store, time.Hour)
+
+	// A lookup reads version 0 and is still in flight...
+	done := make(chan int64)
+	go func() {
+		v, _ := c.SessionVersion(context.Background(), 1)
+		done <- v
+	}()
+	<-store.started
+
+	// ...when the sessions are revoked and the cache invalidated.
+	store.mu.Lock()
+	store.version = 1
+	store.mu.Unlock()
+	c.Invalidate(1)
+	close(store.release)
+	<-done
+
+	// The stale 0 must not have been cached.
+	if v, _ := c.SessionVersion(context.Background(), 1); v != 1 {
+		t.Fatalf("version = %d after a racing Invalidate, want 1", v)
 	}
 }

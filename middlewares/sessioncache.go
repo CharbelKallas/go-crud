@@ -20,6 +20,10 @@ type CachedSessions struct {
 
 	mu      sync.Mutex
 	entries map[int64]cachedSession
+	// gen is incremented by Invalidate. A lookup only caches its result if
+	// no invalidation happened while it was reading the store, so a value
+	// read just before a revocation cannot be written back afterwards.
+	gen uint64
 }
 
 type cachedSession struct {
@@ -34,6 +38,7 @@ func NewCachedSessions(store SessionStore, ttl time.Duration) *CachedSessions {
 func (c *CachedSessions) SessionVersion(ctx context.Context, userID int64) (int64, error) {
 	c.mu.Lock()
 	e, ok := c.entries[userID]
+	gen := c.gen
 	c.mu.Unlock()
 	if ok && c.now().Sub(e.fetchedAt) < c.ttl {
 		return e.version, nil
@@ -44,10 +49,12 @@ func (c *CachedSessions) SessionVersion(ctx context.Context, userID int64) (int6
 		return 0, err
 	}
 	c.mu.Lock()
-	if len(c.entries) >= maxCachedSessions {
-		clear(c.entries)
+	if c.gen == gen { // no Invalidate raced with the read
+		if len(c.entries) >= maxCachedSessions {
+			clear(c.entries)
+		}
+		c.entries[userID] = cachedSession{version: v, fetchedAt: c.now()}
 	}
-	c.entries[userID] = cachedSession{version: v, fetchedAt: c.now()}
 	c.mu.Unlock()
 	return v, nil
 }
@@ -58,5 +65,6 @@ func (c *CachedSessions) SessionVersion(ctx context.Context, userID int64) (int6
 func (c *CachedSessions) Invalidate(userID int64) {
 	c.mu.Lock()
 	delete(c.entries, userID)
+	c.gen++
 	c.mu.Unlock()
 }
